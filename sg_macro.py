@@ -545,11 +545,6 @@ with tabs[2]:
 # ════════════════════════════════════════════════════════════════════════════════
 with tabs[3]:
     st.header("Monetary Policy")
-    st.info("No Fed-Funds-style hike/cut probability section here — MAS doesn't set a policy interest rate. "
-             "It manages monetary policy via the S\\$NEER exchange-rate band, reviewed at scheduled Monetary "
-             "Policy Statements (see the Economic Calendar tab), so there's no futures-implied-probability "
-             "market to build that chart from. SORA below is the key overnight benchmark, not a policy lever. "
-             "Note MAS does not disclose the band's width or slope - only the index level itself is published.")
 
     with st.spinner("Loading S\\$NEER…"):
         neer = fetch_sneer()
