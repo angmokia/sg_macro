@@ -165,6 +165,18 @@ def fetch_sgs_yield(tenor: str, label: str, rows=1500) -> pd.DataFrame:
         st.warning(f"Could not load {label}: {e}")
         return pd.DataFrame()
 
+def _interp_sg_yield_curve(row_vals, tenor_years, target_years):
+    """Linearly interpolate a yield-curve snapshot onto arbitrary target maturities. SGS
+    actually quotes a real benchmark all the way out to 50Y, so unlike the US dashboard's
+    version of this helper, most ladder points here need no interpolation at all - only the
+    5-year-spaced points between real benchmarks (e.g. 22.5Y, 35Y) do."""
+    pairs = sorted((tenor_years[lbl], row_vals[lbl]) for lbl in row_vals.index
+                   if lbl in tenor_years and pd.notna(row_vals[lbl]))
+    if not pairs:
+        return [None] * len(target_years)
+    xs, ys = zip(*pairs)
+    return list(np.interp(target_years, xs, ys))
+
 @st.cache_data(ttl=21600)  # auction results only change a few times/week
 def load_sgs_auctions() -> pd.DataFrame:
     r = requests.get(f"{MAS_BONDS_BASE}/m/listauctionbondsandbills", headers=HEADERS, timeout=30,
@@ -173,9 +185,105 @@ def load_sgs_auctions() -> pd.DataFrame:
     df = pd.DataFrame(r.json()["result"]["records"])
     for col in ["auction_date", "issue_date", "maturity_date", "ann_date"]:
         df[col] = pd.to_datetime(df[col], errors="coerce")
-    for col in ["auction_amt", "bid_to_cover", "cutoff_yield", "avg_yield"]:
+    for col in ["auction_amt", "total_amt_allot", "bid_to_cover", "cutoff_yield", "avg_yield"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
+
+# Remaining-maturity ladder for outstanding SGS/T-Bills - same buckets as the US Treasury
+# dashboard's MATURITY_LADDER, extended 5 years apart past 30Y (SGS issues out to 50Y, unlike
+# US Treasury which caps at 30Y - no US-style "midpoint bucket" trick is needed there since
+# real SGS benchmark tenors already exist at 35Y/40Y/45Y/50Y... in practice only 50Y is an
+# actual benchmark, but keeping 5Y spacing out to 50Y matches how the US ladder extends past
+# its last real benchmark (30Y) using evenly-spaced buckets).
+SG_MATURITY_LADDER = {
+    "3M": 0.25, "6M": 0.5, "12M": 1, "2Y": 2, "3Y": 3, "4Y": 4, "5Y": 5, "7Y": 7,
+    "10Y": 10, "12Y": 12, "15Y": 15, "20Y": 20, "22.5Y": 22.5, "25Y": 25, "27.5Y": 27.5, "30Y": 30,
+    "35Y": 35, "40Y": 40, "45Y": 45, "50Y": 50,
+}
+_SG_LADDER_ITEMS = list(SG_MATURITY_LADDER.items())
+_SG_LADDER_ORDER = {label: i for i, label in enumerate(SG_MATURITY_LADDER)}
+
+def _sg_nearest_maturity_bucket(years_left):
+    return min(_SG_LADDER_ITEMS, key=lambda kv: abs(kv[1] - years_left))[0]
+
+def _sg_bond_category(row):
+    # bill_bond_ind + product_type distinguishes T-Bills / MAS Bills / Cash Management Bills;
+    # for bonds, sgs_type carries MAS's own category - verified live against the real API
+    # (listbondsandbills): "SGS (MD)" (Market Development), "SGS (Infra)", "Green SGS (Infra)",
+    # plus a handful of older "U" (undefined/pre-classification) records.
+    if row["bill_bond_ind"] == "bill":
+        pt = row.get("product_type")
+        if pt == "M":
+            return "MAS Bills"
+        if pt == "C":
+            return "CMB"
+        return "T-Bills"
+    sgs_type = row.get("sgs_type")
+    if sgs_type == "SGS (MD)":
+        return "SGS (Market Dev.)"
+    if sgs_type == "SGS (Infra)":
+        return "SGS (Infra)"
+    if sgs_type == "Green SGS (Infra)":
+        return "SGS (Green Infra)"
+    return "SGS (Other)"
+
+SG_CATEGORY_COLORS = {
+    "T-Bills": "#42a5f5", "MAS Bills": "#26c6da", "CMB": "#8d6e63",
+    "SGS (Market Dev.)": "#26a69a", "SGS (Infra)": "#ff9800",
+    "SGS (Green Infra)": "#66bb6a", "SGS (Other)": "#9e9e9e",
+}
+
+def get_sg_outstanding_by_remaining_maturity(auctions_df):
+    today = pd.Timestamp.today().normalize()
+    outstanding = auctions_df[(auctions_df["issue_date"] <= today) & (auctions_df["maturity_date"] > today)].copy()
+    outstanding["years_to_maturity"] = (outstanding["maturity_date"] - today).dt.days / 365.25
+    outstanding["amt_bil"] = outstanding["total_amt_allot"].fillna(outstanding["auction_amt"]) / 1000  # S$M -> S$B
+    outstanding["maturity_bucket"] = outstanding["years_to_maturity"].apply(_sg_nearest_maturity_bucket)
+    outstanding["category"] = outstanding.apply(_sg_bond_category, axis=1)
+    summary = outstanding.groupby(["maturity_bucket", "category"])["amt_bil"].sum().reset_index()
+    return outstanding, summary
+
+def _sg_true_original_tenor_bucket(auctions_df):
+    """Map each issue_code to its true original-tenor bucket, using the EARLIEST issue_date
+    across all of that issue_code's auction events (initial issue + every reopening).
+    MAS's own `first_issue_date` field is NOT reliable for this - verified live that it just
+    repeats that specific auction event's own issue_date rather than the true original issue
+    date. issue_code/ISIN and maturity_date stay constant across reopenings, though - live
+    check on NX21100N: first issued 2021-07-01, reopened 2022-03-01 and again 2026-07-01, all
+    maturing 2031-07-01 - true original tenor is 10Y, not the ~5Y a naive per-event
+    (maturity - that event's issue_date) calc would give for the 2026 reopening. Same class of
+    bug as the original US Treasury tenor-bucketing fix."""
+    first_issue = auctions_df.groupby("issue_code")["issue_date"].min()
+    maturity = auctions_df.groupby("issue_code")["maturity_date"].first()
+    tenor_years = (maturity - first_issue).dt.days / 365.25
+    return tenor_years.apply(_sg_nearest_maturity_bucket)
+
+def get_sg_net_issuance(auctions_df, days_window):
+    """Recently-issued (past days_window, real settled amounts) vs upcoming maturities (next
+    days_window, also real/known amounts) by true original-tenor bucket. Not simply a
+    forward-looking version of the US 'Issuance vs Maturity' chart - MAS doesn't disclose
+    auction size until after the auction closes, so there's no free source for FUTURE issuance
+    amounts (same limitation as the Upcoming SGS/T-Bill Issuance table). Using a trailing
+    issuance window instead keeps every number on this chart real and settled."""
+    today = pd.Timestamp.today().normalize()
+    bucket_map = _sg_true_original_tenor_bucket(auctions_df)
+    df = auctions_df.copy()
+    df["tenor_bucket"] = df["issue_code"].map(bucket_map)
+    df["amt_bil"] = df["total_amt_allot"].fillna(df["auction_amt"]) / 1000
+
+    issued = df[(df["issue_date"] >= today - pd.Timedelta(days=days_window)) & (df["issue_date"] <= today)]
+    issuance_summary = issued.groupby("tenor_bucket")["amt_bil"].sum()
+
+    maturing = df[(df["maturity_date"] >= today) & (df["maturity_date"] <= today + pd.Timedelta(days=days_window))]
+    maturity_summary = maturing.groupby("tenor_bucket")["amt_bil"].sum()
+
+    labels = list(SG_MATURITY_LADDER.keys())
+    combined = pd.DataFrame(index=labels)
+    combined["Issuance"] = issuance_summary.reindex(labels).fillna(0)
+    combined["Maturing"] = maturity_summary.reindex(labels).fillna(0)
+    combined["Net"] = combined["Issuance"] - combined["Maturing"]
+    combined = combined[(combined["Issuance"] != 0) | (combined["Maturing"] != 0)]
+    return combined.reset_index().rename(columns={"index": "tenor_bucket"})
 
 @st.cache_data(ttl=21600)
 def load_sgs_issuance_calendar() -> pd.DataFrame:
@@ -189,14 +297,6 @@ def load_sgs_issuance_calendar() -> pd.DataFrame:
     for col in ["ann_date", "auction_date", "issue_date", "maturity_date"]:
         df[col] = pd.to_datetime(df[col], errors="coerce")
     return df
-
-@st.cache_data(ttl=86400)
-def load_sgs_outstanding() -> pd.DataFrame:
-    r = requests.get(f"{MAS_BONDS_BASE}/m/outstandingsgs_m", headers=HEADERS, timeout=20, params={"rows": 1000})
-    r.raise_for_status()
-    df = pd.DataFrame(r.json()["result"]["records"])
-    df["date"] = pd.to_datetime(df["end_of_period"])
-    return df.set_index("date").sort_index()
 
 # ── S$NEER (MAS's own official weekly index) ────────────────────────────────────
 # www.mas.gov.sg's own page (Statistics > Exchange Rates > S$NEER) publishes this
@@ -545,6 +645,11 @@ with tabs[2]:
 # ════════════════════════════════════════════════════════════════════════════════
 with tabs[3]:
     st.header("Monetary Policy")
+    st.info("No Fed-Funds-style hike/cut probability section here — MAS doesn't set a policy interest rate. "
+             "It manages monetary policy via the S\\$NEER exchange-rate band, reviewed at scheduled Monetary "
+             "Policy Statements (see the Economic Calendar tab), so there's no futures-implied-probability "
+             "market to build that chart from. SORA below is the key overnight benchmark, not a policy lever. "
+             "Note MAS does not disclose the band's width or slope - only the index level itself is published.")
 
     with st.spinner("Loading S\\$NEER…"):
         neer = fetch_sneer()
@@ -607,18 +712,59 @@ with tabs[3]:
     fig_yc_hist.update_layout(**base_layout("SGS 2Y / 5Y / 10Y Yields"))
     fig_yc_hist.update_yaxes(ticksuffix="%")
 
-    with st.spinner("Loading outstanding SGS…"):
-        outstanding = load_sgs_outstanding()
-    fig_out = go.Figure()
-    o = clip(outstanding)
-    if not o.empty:
-        for col, label, color in [("bills_b", "T-Bills", "#42a5f5"), ("sgs_md_b", "SGS (Market Dev.)", "#26a69a"),
-                                   ("sgs_infra_b", "SGS Infra", "#ff9800"), ("sgs_green_infra_b", "SGS Green/Infra", "#ab47bc")]:
-            fig_out.add_trace(go.Scatter(x=o.index, y=o[col], name=label, stackgroup="one"))
-    fig_out.update_layout(**base_layout("Outstanding SGS & T-Bills by Category (S$ Billion)"))
+    # Spreads over time - 2s5s/2s10s/5s30s are simple slope spreads, 2s5s10s is the classic
+    # butterfly (2x the belly minus both wings). All in bps, on one chart.
+    fig_spreads = go.Figure()
+    spread_curve = pd.DataFrame()
+    if all(t in yc.columns for t in ["2Y", "5Y", "10Y", "30Y"]):
+        spread_curve = yc[["2Y", "5Y", "10Y", "30Y"]].dropna()
+        spreads_sg = pd.DataFrame(index=spread_curve.index)
+        spreads_sg["2s5s"] = (spread_curve["5Y"] - spread_curve["2Y"]) * 100
+        spreads_sg["2s10s"] = (spread_curve["10Y"] - spread_curve["2Y"]) * 100
+        spreads_sg["2s5s10s"] = (2 * spread_curve["5Y"] - spread_curve["10Y"] - spread_curve["2Y"]) * 100
+        spreads_sg["5s30s"] = (spread_curve["30Y"] - spread_curve["5Y"]) * 100
+        spreads_sg = clip(spreads_sg)
+        for col, color in [("2s5s", "#42a5f5"), ("2s10s", "#26a69a"), ("2s5s10s", "#ff9800"), ("5s30s", "#ab47bc")]:
+            fig_spreads.add_trace(go.Scatter(x=spreads_sg.index, y=spreads_sg[col], name=col, mode="lines", line=dict(color=color)))
+        fig_spreads.add_hline(y=0, line_dash="dot", line_color="#555")
+    fig_spreads.update_layout(**base_layout("SGS Curve Spreads — 2s5s / 2s10s / 2s5s10s / 5s30s"))
+    fig_spreads.update_yaxes(ticksuffix=" bps")
 
     with st.spinner("Loading SGS auction results…"):
         auctions = load_sgs_auctions()
+
+    # Outstanding by remaining maturity (nearest-tenor ladder, same buckets as the US
+    # dashboard's version, extended 5Y apart past 30Y since SGS issues out to 50Y), stacked by
+    # bond category, with the yield curve overlaid on a secondary axis.
+    with st.spinner("Computing outstanding SGS by remaining maturity…"):
+        _, sg_outstanding_summary = get_sg_outstanding_by_remaining_maturity(auctions)
+    sg_ladder_labels = list(SG_MATURITY_LADDER.keys())
+    sg_pivot = sg_outstanding_summary.pivot_table(index="maturity_bucket", columns="category", values="amt_bil", aggfunc="sum")
+    sg_pivot = sg_pivot.reindex(sg_ladder_labels).fillna(0)
+
+    fig_sg_outstanding = go.Figure()
+    for cat in sg_pivot.columns:
+        if sg_pivot[cat].sum() > 0:
+            fig_sg_outstanding.add_trace(go.Bar(
+                x=sg_ladder_labels, y=sg_pivot[cat], name=cat,
+                marker_color=SG_CATEGORY_COLORS.get(cat, "#9e9e9e"), yaxis="y"))
+    if not yc.empty:
+        tenor_years = {label: float(code) for label, code in TENORS.items()}
+        target_years = list(SG_MATURITY_LADDER.values())
+        for label, offset in snap_labels.items():
+            idx = max(0, len(yc) - 1 + offset)
+            interp_yields = _interp_sg_yield_curve(yc.iloc[idx], tenor_years, target_years)
+            fig_sg_outstanding.add_trace(go.Scatter(
+                x=sg_ladder_labels, y=interp_yields, mode="lines+markers", name=f"Yield: {label}",
+                yaxis="y2", line=dict(color=snap_colors[label], width=2 if label == "Latest" else 1,
+                                       dash="solid" if label == "Latest" else "dash"),
+                marker=dict(size=4)))
+    total_sg_outstanding = sg_pivot.values.sum()
+    fig_sg_outstanding.update_layout(**dual_axis_layout(
+        f"Outstanding SGS & T-Bills by Remaining Maturity (S${total_sg_outstanding:,.0f}B)",
+        "Outstanding (S$ Billion)", "Yield (%)"))
+    fig_sg_outstanding.update_layout(barmode="stack", yaxis2=dict(ticksuffix="%"))
+
     bc_type = st.selectbox("Bid-to-cover: instrument type", sorted(auctions["bill_bond_ind"].dropna().unique()), key="sg_bc_type")
     bc_hist = auctions[(auctions["bill_bond_ind"] == bc_type) & auctions["bid_to_cover"].notna() &
                         (auctions["auction_date"] >= START) & (auctions["auction_date"] <= END)].sort_values("auction_date")
@@ -628,13 +774,34 @@ with tabs[3]:
                                       mode="markers", marker=dict(size=4, color="#90a4d4")))
     fig_btc.update_layout(**base_layout(f"Bid-to-Cover Ratio — {bc_type.title()}s"))
 
+    # Net issuance - recently issued (past Nd) vs upcoming maturities (next Nd), both real
+    # settled amounts (see get_sg_net_issuance for why this is trailing rather than forward
+    # like the US "Issuance vs Maturity" chart).
+    net_issuance_days = st.select_slider("Net Issuance window (days)", options=[30, 60, 90, 180], value=90, key="sg_net_issuance_days")
+    with st.spinner("Computing net issuance…"):
+        net_issuance_df = get_sg_net_issuance(auctions, net_issuance_days)
+    fig_net_issuance = go.Figure()
+    if not net_issuance_df.empty:
+        fig_net_issuance.add_trace(go.Bar(x=net_issuance_df["tenor_bucket"], y=net_issuance_df["Issuance"],
+                                           name="Issued", marker_color="#26a69a"))
+        fig_net_issuance.add_trace(go.Bar(x=net_issuance_df["tenor_bucket"], y=-net_issuance_df["Maturing"],
+                                           name="Maturing", marker_color="#ef5350"))
+        fig_net_issuance.add_trace(go.Scatter(x=net_issuance_df["tenor_bucket"], y=net_issuance_df["Net"],
+                                               name="Net Issuance", mode="lines+markers", line=dict(color="#90a4d4", width=2)))
+    total_net = net_issuance_df["Net"].sum() if not net_issuance_df.empty else 0
+    fig_net_issuance.update_layout(**base_layout(
+        f"Net Issuance by Original Tenor — Issued (past {net_issuance_days}d) vs Maturing (next {net_issuance_days}d), Net: S${total_net:,.1f}B"))
+    fig_net_issuance.update_layout(barmode="relative")
+
     render_two_col([
         ("SGD NEER", fig_neer, n),
         ("SGD NEER WoW Change", fig_neer_wow, neer_wow),
         ("SORA", fig_sora, s),
         ("SGS Yield Curve Snapshots", fig_yc, yc.tail(1)),
         ("SGS 2Y/5Y/10Y Yields", fig_yc_hist, clip(yc[["2Y", "5Y", "10Y"]]) if not yc.empty else pd.DataFrame()),
-        ("Outstanding SGS by Category", fig_out, o),
+        ("SGS Curve Spreads", fig_spreads, spread_curve),
+        ("Outstanding SGS by Remaining Maturity", fig_sg_outstanding, sg_pivot.reset_index()),
+        ("Net Issuance", fig_net_issuance, net_issuance_df),
         ("Bid-to-Cover Trend", fig_btc, bc_hist[["auction_date", "issue_code", "bid_to_cover"]]),
     ])
 
