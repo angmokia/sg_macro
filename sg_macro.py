@@ -630,16 +630,22 @@ with tabs[1]:
         emp_chg   = fetch_singstat("M183891", "Employment Change")
         job_vac   = fetch_singstat("M181641", "Job Vacancy Rate", series_no="3")
 
+    # GDP level is quarterly (M014871), so the raw quarterly figure (~S$200B) reads far below
+    # the ~S$650-790B annual GDP everyone actually knows. Trailing 4-quarter sum gives an
+    # annualised run-rate instead - computed on the full series before clipping to the date
+    # range, so the first visible quarter still has 3 real prior quarters behind it.
+    gdp_level_annualized = gdp_level[["GDP (S$M)"]].rolling(4).sum().dropna()
+
     fig_gdp = go.Figure()
-    g_level = clip(gdp_level)
+    g_level = clip(gdp_level_annualized)
     if not g_level.empty:
         fig_gdp.add_trace(go.Scatter(x=g_level.index, y=g_level["GDP (S$M)"] / 1000,
-                                     name="GDP Level (S$B)", line=dict(color="#26a69a"), yaxis="y"))
+                                     name="GDP Level (S$B, Trailing 4Q)", line=dict(color="#26a69a"), yaxis="y"))
     g_yoy = clip(gdp_yoy)
     if not g_yoy.empty:
         fig_gdp.add_trace(go.Scatter(x=g_yoy.index, y=g_yoy["GDP YoY %"],
                                      name="YoY %", line=dict(color="#ff9800", dash="dot"), yaxis="y2"))
-    fig_gdp.update_layout(**dual_axis_layout("GDP Level vs YoY Growth", "S$ Billion", "YoY %"))
+    fig_gdp.update_layout(**dual_axis_layout("GDP Level (Annualised) vs YoY Growth", "S$ Billion", "YoY %"))
 
     fig_saar = go.Figure()
     g_saar = clip(gdp_saar)
