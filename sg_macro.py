@@ -421,6 +421,14 @@ END   = pd.Timestamp(date_range[1])
 def clip(df):
     return df[(df.index >= START) & (df.index <= END)] if not df.empty else df
 
+def qlabels(index):
+    """SingStat quarterly series are indexed at each quarter's START date (pandas Period
+    convention - e.g. Q3 2023 = Jul-Sep is dated 2023-07-01). Plotly's default date-formatted
+    x-axis/hover then shows that as "Jul 2023", which reads as "the Q2 result released around
+    July" rather than "the Jul-Sep quarter" - a real misread the raw date alone invites. This
+    gives hover text an unambiguous "20XX QN" label instead."""
+    return [f"{ts.year} Q{(ts.month - 1) // 3 + 1}" for ts in index]
+
 # ── Summary bar ───────────────────────────────────────────────────────────────
 st.markdown('<div class="section-header">Latest Readings</div>', unsafe_allow_html=True)
 
@@ -640,18 +648,24 @@ with tabs[1]:
     g_level = clip(gdp_level_annualized)
     if not g_level.empty:
         fig_gdp.add_trace(go.Scatter(x=g_level.index, y=g_level["GDP (S$M)"] / 1000,
-                                     name="GDP Level (S$B, Trailing 4Q)", line=dict(color="#26a69a"), yaxis="y"))
+                                     name="GDP Level (S$B, Trailing 4Q)", line=dict(color="#26a69a"), yaxis="y",
+                                     customdata=qlabels(g_level.index),
+                                     hovertemplate="%{customdata}: S$%{y:.1f}B<extra></extra>"))
     g_yoy = clip(gdp_yoy)
     if not g_yoy.empty:
         fig_gdp.add_trace(go.Scatter(x=g_yoy.index, y=g_yoy["GDP YoY %"],
-                                     name="YoY %", line=dict(color="#ff9800", dash="dot"), yaxis="y2"))
+                                     name="YoY %", line=dict(color="#ff9800", dash="dot"), yaxis="y2",
+                                     customdata=qlabels(g_yoy.index),
+                                     hovertemplate="%{customdata}: %{y:.1f}%<extra></extra>"))
     fig_gdp.update_layout(**dual_axis_layout("GDP Level (Annualised) vs YoY Growth", "S$ Billion", "YoY %"))
 
     fig_saar = go.Figure()
     g_saar = clip(gdp_saar)
     if not g_saar.empty:
         colors = ["#26a69a" if v >= 0 else "#ef5350" for v in g_saar["GDP QoQ SAAR %"].fillna(0)]
-        fig_saar.add_trace(go.Bar(x=g_saar.index, y=g_saar["GDP QoQ SAAR %"], marker_color=colors))
+        fig_saar.add_trace(go.Bar(x=g_saar.index, y=g_saar["GDP QoQ SAAR %"], marker_color=colors,
+                                   customdata=qlabels(g_saar.index),
+                                   hovertemplate="%{customdata}: %{y:.1f}%<extra></extra>"))
     fig_saar.add_hline(y=0, line_dash="dot", line_color="#555")
     fig_saar.update_layout(**base_layout("GDP QoQ, Seasonally Adjusted Annualised Rate"))
     fig_saar.update_yaxes(ticksuffix="%")
@@ -660,7 +674,9 @@ with tabs[1]:
     u = clip(unemp)
     if not u.empty:
         fig_unemp.add_trace(go.Scatter(x=u.index, y=u["Unemployment Rate"], name="Unemployment Rate",
-                                       line=dict(color="#ef5350")))
+                                       line=dict(color="#ef5350"),
+                                       customdata=qlabels(u.index),
+                                       hovertemplate="%{customdata}: %{y:.1f}%<extra></extra>"))
     fig_unemp.update_layout(**base_layout("Unemployment Rate (Overall, Seasonally Adjusted)"))
     fig_unemp.update_yaxes(ticksuffix="%")
 
@@ -668,7 +684,9 @@ with tabs[1]:
     e = clip(emp_chg)
     if not e.empty:
         colors = ["#26a69a" if v >= 0 else "#ef5350" for v in e["Employment Change"].fillna(0)]
-        fig_emp.add_trace(go.Bar(x=e.index, y=e["Employment Change"], marker_color=colors))
+        fig_emp.add_trace(go.Bar(x=e.index, y=e["Employment Change"], marker_color=colors,
+                                  customdata=qlabels(e.index),
+                                  hovertemplate="%{customdata}: %{y:,.0f}<extra></extra>"))
     fig_emp.update_layout(**base_layout("Total Employment Change (QoQ, persons)"))
 
     # Job Vacancy Rate - Singapore's JOLTS-openings-rate equivalent, from MOM via the same
@@ -677,7 +695,9 @@ with tabs[1]:
     jv = clip(job_vac)
     if not jv.empty:
         fig_job_vac.add_trace(go.Scatter(x=jv.index, y=jv["Job Vacancy Rate"], name="Job Vacancy Rate",
-                                         line=dict(color="#26a69a")))
+                                         line=dict(color="#26a69a"),
+                                         customdata=qlabels(jv.index),
+                                         hovertemplate="%{customdata}: %{y:.1f}%<extra></extra>"))
     fig_job_vac.update_layout(**base_layout("Job Vacancy Rate"))
     fig_job_vac.update_yaxes(ticksuffix="%")
 
@@ -724,10 +744,14 @@ with tabs[2]:
     priv_c = clip(private_ppi)
     if not hdb_c.empty:
         fig_property.add_trace(go.Scatter(x=hdb_c.index, y=hdb_c["HDB Resale (Public)"],
-                                          name="HDB Resale (Public)", line=dict(color="#42a5f5")))
+                                          name="HDB Resale (Public)", line=dict(color="#42a5f5"),
+                                          customdata=qlabels(hdb_c.index),
+                                          hovertemplate="%{customdata}: %{y:.1f}<extra></extra>"))
     if not priv_c.empty:
         fig_property.add_trace(go.Scatter(x=priv_c.index, y=priv_c["Private Residential"],
-                                          name="Private Residential", line=dict(color="#ef5350")))
+                                          name="Private Residential", line=dict(color="#ef5350"),
+                                          customdata=qlabels(priv_c.index),
+                                          hovertemplate="%{customdata}: %{y:.1f}<extra></extra>"))
     fig_property.update_layout(**base_layout("HDB Resale vs Private Residential Property Price Index (1Q2009 = 100)"))
 
     render_two_col([
