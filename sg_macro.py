@@ -442,7 +442,12 @@ def get_summary_metrics():
     except Exception:
         metrics["Core Infl. YoY"] = (None, None, "")
     try:
-        gdp = fetch_singstat("M015631", "GDP YoY")["GDP YoY"].dropna()
+        # series_no="2" is "GDP In Chained (2015) Dollars" - real GDP, the standard headline
+        # figure (e.g. MTI's own release). series_no="1" (the default) is nominal GDP "At
+        # Current Market Prices" and reads roughly 2x too high - confirmed live: series "1"
+        # gave 12.4% for 2Q 2026 vs series "2"'s 5.9%, which matches MTI's reported figure
+        # exactly.
+        gdp = fetch_singstat("M015631", "GDP YoY", series_no="2")["GDP YoY"].dropna()
         metrics["GDP YoY"] = (float(gdp.iloc[-1]), float(gdp.iloc[-1] - gdp.iloc[-2]), "%")
     except Exception:
         metrics["GDP YoY"] = (None, None, "")
@@ -617,7 +622,9 @@ with tabs[1]:
     st.header("Growth & Labour")
     with st.spinner("Loading growth & labour data…"):
         gdp_level = fetch_singstat("M014871", "GDP (S$M)")
-        gdp_yoy   = fetch_singstat("M015631", "GDP YoY %")
+        # series_no="2" = real GDP ("In Chained (2015) Dollars") - see get_summary_metrics
+        # above for why series_no="1" (nominal, the default) is wrong for this chart.
+        gdp_yoy   = fetch_singstat("M015631", "GDP YoY %", series_no="2")
         gdp_saar  = fetch_singstat("M015792", "GDP QoQ SAAR %")
         unemp     = fetch_singstat("M182342", "Unemployment Rate")
         emp_chg   = fetch_singstat("M183891", "Employment Change")
