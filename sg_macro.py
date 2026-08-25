@@ -534,6 +534,25 @@ with tabs[0]:
         core = mom_yoy(fetch_singstat("M213891", "Core"), "Core", 12)
         rsi  = mom_yoy(fetch_singstat("M602122", "Retail Sales"), "Retail Sales", 12)
 
+        # CPI components - the 10 major expenditure groups SingStat publishes under the same
+        # resourceId (M213751) already used for headline CPI above, just different series rows.
+        CPI_GROUPS_SG = [
+            ("Food",                          "1.0"),
+            ("Clothing & Footwear",           "1.02"),
+            ("Housing & Utilities",           "1.03"),
+            ("Household Durables & Services", "1.04"),
+            ("Health",                        "1.05"),
+            ("Transport",                     "1.06"),
+            ("Info & Communication",          "1.07"),
+            ("Recreation, Sport & Culture",   "1.08"),
+            ("Education",                     "1.09"),
+            ("Miscellaneous",                 "1.10"),
+        ]
+        cpi_components_sg = {
+            label: mom_yoy(fetch_singstat("M213751", label, series_no=sno), label, 12)
+            for label, sno in CPI_GROUPS_SG
+        }
+
     fig_cpi = go.Figure()
     for col in pd.concat([cpi, core], axis=1).columns:
         src = clip(pd.concat([cpi, core], axis=1))
@@ -550,9 +569,45 @@ with tabs[0]:
         fig_rsi.add_trace(go.Scatter(x=src.index, y=src[col], name=col, mode="lines", yaxis=ax))
     fig_rsi.update_layout(**dual_axis_layout("Retail Sales Index (MoM & YoY)", "YoY %", "MoM %"))
 
+    # CPI components - YoY % history (all 10 groups) + latest MoM/YoY snapshot, same pairing
+    # as the US dashboard's CPI Components charts.
+    fig_cpi_comp_hist = go.Figure()
+    for label, _ in CPI_GROUPS_SG:
+        df_c = clip(cpi_components_sg[label])
+        col = f"{label} YoY %"
+        if not df_c.empty and col in df_c.columns:
+            fig_cpi_comp_hist.add_trace(go.Scatter(x=df_c.index, y=df_c[col], name=label, mode="lines"))
+    fig_cpi_comp_hist.update_layout(**base_layout("CPI Components — YoY %"))
+    fig_cpi_comp_hist.update_yaxes(ticksuffix="%")
+
+    comp_rows_sg = []
+    for label, _ in CPI_GROUPS_SG:
+        df_c = cpi_components_sg[label]
+        mom_col, yoy_col = f"{label} MoM %", f"{label} YoY %"
+        if df_c.empty or mom_col not in df_c.columns:
+            continue
+        mom_s, yoy_s = df_c[mom_col].dropna(), df_c[yoy_col].dropna()
+        if mom_s.empty or yoy_s.empty:
+            continue
+        comp_rows_sg.append({"Component": label, "MoM %": mom_s.iloc[-1], "YoY %": yoy_s.iloc[-1], "As Of": df_c.index[-1]})
+    comp_df_sg = pd.DataFrame(comp_rows_sg).sort_values("YoY %", ascending=True)
+    comp_latest_date_sg = comp_df_sg["As Of"].max().strftime("%b %Y") if not comp_df_sg.empty else ""
+    comp_df_sg = comp_df_sg.drop(columns="As Of")
+
+    fig_cpi_comp_snap = go.Figure()
+    fig_cpi_comp_snap.add_trace(go.Bar(y=comp_df_sg["Component"], x=comp_df_sg["YoY %"], name="YoY %",
+                                        orientation="h", marker_color="#ef5350"))
+    fig_cpi_comp_snap.add_trace(go.Bar(y=comp_df_sg["Component"], x=comp_df_sg["MoM %"], name="MoM %",
+                                        orientation="h", marker_color="#ff9800"))
+    fig_cpi_comp_snap.update_layout(**base_layout(f"CPI Components — Latest MoM & YoY % ({comp_latest_date_sg})", height=420))
+    fig_cpi_comp_snap.update_layout(barmode="group")
+    fig_cpi_comp_snap.update_xaxes(ticksuffix="%")
+
     render_two_col([
         ("CPI vs Core Inflation", fig_cpi, clip(pd.concat([cpi, core], axis=1))),
         ("Retail Sales Index", fig_rsi, clip(rsi)),
+        ("CPI Components History", fig_cpi_comp_hist, pd.concat([cpi_components_sg[l] for l, _ in CPI_GROUPS_SG], axis=1)),
+        ("CPI Components Snapshot", fig_cpi_comp_snap, comp_df_sg),
     ])
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -566,6 +621,7 @@ with tabs[1]:
         gdp_saar  = fetch_singstat("M015792", "GDP QoQ SAAR %")
         unemp     = fetch_singstat("M182342", "Unemployment Rate")
         emp_chg   = fetch_singstat("M183891", "Employment Change")
+        job_vac   = fetch_singstat("M181641", "Job Vacancy Rate", series_no="3")
 
     fig_gdp = go.Figure()
     g_level = clip(gdp_level)
@@ -602,11 +658,22 @@ with tabs[1]:
         fig_emp.add_trace(go.Bar(x=e.index, y=e["Employment Change"], marker_color=colors))
     fig_emp.update_layout(**base_layout("Total Employment Change (QoQ, persons)"))
 
+    # Job Vacancy Rate - Singapore's JOLTS-openings-rate equivalent, from MOM via the same
+    # Labour Market Statistics table SingStat already exposes the unemployment rate through.
+    fig_job_vac = go.Figure()
+    jv = clip(job_vac)
+    if not jv.empty:
+        fig_job_vac.add_trace(go.Scatter(x=jv.index, y=jv["Job Vacancy Rate"], name="Job Vacancy Rate",
+                                         line=dict(color="#26a69a")))
+    fig_job_vac.update_layout(**base_layout("Job Vacancy Rate"))
+    fig_job_vac.update_yaxes(ticksuffix="%")
+
     render_two_col([
         ("GDP Level vs YoY", fig_gdp, pd.concat([g_level, g_yoy], axis=1)),
         ("GDP QoQ SAAR", fig_saar, g_saar),
         ("Unemployment Rate", fig_unemp, u),
         ("Employment Change", fig_emp, e),
+        ("Job Vacancy Rate", fig_job_vac, jv),
     ])
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -614,12 +681,14 @@ with tabs[1]:
 # ════════════════════════════════════════════════════════════════════════════════
 with tabs[2]:
     st.header("Trade & Production")
-    st.caption("Singapore-specific external-facing indicators — the US dashboard's Housing tab has no direct "
-               "equivalent here (no free, comparably granular SG property-transaction API was confirmed), so "
-               "this slot covers trade & industrial activity instead.")
+    st.caption("Singapore-specific external-facing indicators, plus property prices below — SingStat does "
+               "publish real housing price indices (HDB resale + private residential), just at quarterly "
+               "granularity rather than the US dashboard's monthly Case-Shiller.")
     with st.spinner("Loading trade & production data…"):
         nodx = mom_yoy(fetch_singstat("M451301", "NODX"), "NODX", 12)
         ipi  = mom_yoy(fetch_singstat("M355352", "IPI"), "IPI", 12)
+        hdb_rpi = fetch_singstat("M212161", "HDB Resale (Public)")
+        private_ppi = fetch_singstat("M212261", "Private Residential")
 
     fig_nodx = go.Figure()
     src = clip(nodx)
@@ -635,9 +704,23 @@ with tabs[2]:
         fig_ipi.add_trace(go.Scatter(x=src.index, y=src[col], name=col, mode="lines", yaxis=ax))
     fig_ipi.update_layout(**dual_axis_layout("Industrial Production Index", "YoY %", "MoM %"))
 
+    # HDB resale vs private residential price index - both base 1Q2009=100, so they share one
+    # axis honestly (same unit, same base period) rather than needing a dual-axis chart.
+    fig_property = go.Figure()
+    hdb_c = clip(hdb_rpi)
+    priv_c = clip(private_ppi)
+    if not hdb_c.empty:
+        fig_property.add_trace(go.Scatter(x=hdb_c.index, y=hdb_c["HDB Resale (Public)"],
+                                          name="HDB Resale (Public)", line=dict(color="#42a5f5")))
+    if not priv_c.empty:
+        fig_property.add_trace(go.Scatter(x=priv_c.index, y=priv_c["Private Residential"],
+                                          name="Private Residential", line=dict(color="#ef5350")))
+    fig_property.update_layout(**base_layout("HDB Resale vs Private Residential Property Price Index (1Q2009 = 100)"))
+
     render_two_col([
         ("NODX", fig_nodx, clip(nodx)),
         ("Industrial Production Index", fig_ipi, clip(ipi)),
+        ("Property Price Index", fig_property, pd.concat([hdb_c, priv_c], axis=1)),
     ])
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -682,6 +765,44 @@ with tabs[3]:
         fig_sora.add_trace(go.Scatter(x=s.index, y=s["SORA"], name="SORA", line=dict(color="#90a4d4")))
     fig_sora.update_layout(**base_layout("SORA — Singapore Overnight Rate Average"))
     fig_sora.update_yaxes(ticksuffix="%")
+
+    with st.spinner("Loading money supply, reserves & government revenue…"):
+        m3 = fetch_singstat("M701111", "M3")
+        fx_reserves = fetch_singstat("M700031", "Official Foreign Reserves")
+        gov_revenue = fetch_singstat("M130501", "Government Operating Revenue")
+
+    # Money supply (M3) - only M3 is published as its own resourceId; MAS doesn't break out
+    # M1/M2 the same granular way FRED does for the US dashboard's M2 chart.
+    fig_m3 = go.Figure()
+    m3_c = clip(m3)
+    if not m3_c.empty:
+        fig_m3.add_trace(go.Scatter(x=m3_c.index, y=m3_c["M3"] / 1000, name="M3",
+                                    line=dict(color="#26a69a"), fill="tozeroy", fillcolor="rgba(38,166,154,0.15)"))
+    fig_m3.update_layout(**base_layout("Money Supply (M3)"))
+    fig_m3.update_yaxes(ticksuffix="B", title="S$ Billion")
+
+    # Official Foreign Reserves - Singapore has no TGA; this is MAS's own published reserves
+    # balance, the closest real analogue to a fiscal/monetary buffer metric.
+    fig_reserves = go.Figure()
+    res_c = clip(fx_reserves)
+    if not res_c.empty:
+        fig_reserves.add_trace(go.Scatter(x=res_c.index, y=res_c["Official Foreign Reserves"] / 1000,
+                                          name="Official Foreign Reserves", line=dict(color="#42a5f5"),
+                                          fill="tozeroy", fillcolor="rgba(66,165,245,0.15)"))
+    fig_reserves.update_layout(**base_layout("Official Foreign Reserves"))
+    fig_reserves.update_yaxes(ticksuffix="B", title="S$ Billion")
+
+    # Government Operating Revenue - monthly, real, and lumpy (property tax collection months
+    # spike). Revenue only, not a full receipts/outlays/deficit chart: no monthly total-
+    # expenditure series was found on SingStat, only annual.
+    fig_gov_rev = go.Figure()
+    gov_c = clip(gov_revenue)
+    if not gov_c.empty:
+        fig_gov_rev.add_trace(go.Scatter(x=gov_c.index, y=gov_c["Government Operating Revenue"],
+                                         name="Government Operating Revenue", line=dict(color="#eda100"),
+                                         fill="tozeroy", fillcolor="rgba(237,161,0,0.15)"))
+    fig_gov_rev.update_layout(**base_layout("Government Operating Revenue (Monthly)"))
+    fig_gov_rev.update_yaxes(title="S$ Million")
 
     TENORS = {"6M": "0.5", "1Y": "1", "2Y": "2", "5Y": "5", "10Y": "10", "15Y": "15", "20Y": "20", "30Y": "30", "50Y": "50"}
     with st.spinner("Loading SGS yields…"):
@@ -767,11 +888,15 @@ with tabs[3]:
 
     bc_type = st.selectbox("Bid-to-cover: instrument type", sorted(auctions["bill_bond_ind"].dropna().unique()), key="sg_bc_type")
     bc_hist = auctions[(auctions["bill_bond_ind"] == bc_type) & auctions["bid_to_cover"].notna() &
-                        (auctions["auction_date"] >= START) & (auctions["auction_date"] <= END)].sort_values("auction_date")
+                        (auctions["auction_date"] >= START) & (auctions["auction_date"] <= END)].sort_values("auction_date").copy()
+    # One line per true original-tenor bucket (not raw auction_tenor, which fragments
+    # reopenings the same way security_term_week_year did on the US dashboard before that fix).
+    bc_hist["tenor_bucket"] = bc_hist["issue_code"].map(_sg_true_original_tenor_bucket(auctions))
     fig_btc = go.Figure()
-    if not bc_hist.empty:
-        fig_btc.add_trace(go.Scatter(x=bc_hist["auction_date"], y=bc_hist["bid_to_cover"],
-                                      mode="markers", marker=dict(size=4, color="#90a4d4")))
+    for term in sorted(bc_hist["tenor_bucket"].dropna().unique(), key=lambda t: _SG_LADDER_ORDER.get(t, 999)):
+        term_df = bc_hist[bc_hist["tenor_bucket"] == term]
+        fig_btc.add_trace(go.Scatter(x=term_df["auction_date"], y=term_df["bid_to_cover"],
+                                      mode="lines+markers", name=term, marker=dict(size=4)))
     fig_btc.update_layout(**base_layout(f"Bid-to-Cover Ratio — {bc_type.title()}s"))
 
     # Net issuance - recently issued (past Nd) vs upcoming maturities (next Nd), both real
@@ -802,7 +927,10 @@ with tabs[3]:
         ("SGS Curve Spreads", fig_spreads, spread_curve),
         ("Outstanding SGS by Remaining Maturity", fig_sg_outstanding, sg_pivot.reset_index()),
         ("Net Issuance", fig_net_issuance, net_issuance_df),
-        ("Bid-to-Cover Trend", fig_btc, bc_hist[["auction_date", "issue_code", "bid_to_cover"]]),
+        ("Bid-to-Cover Trend", fig_btc, bc_hist[["auction_date", "issue_code", "tenor_bucket", "bid_to_cover"]]),
+        ("Money Supply (M3)", fig_m3, m3_c),
+        ("Official Foreign Reserves", fig_reserves, res_c),
+        ("Government Operating Revenue", fig_gov_rev, gov_c),
     ])
 
     st.markdown('<div class="section-header">Upcoming SGS / T-Bill Issuance</div>', unsafe_allow_html=True)
