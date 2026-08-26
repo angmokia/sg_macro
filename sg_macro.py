@@ -418,10 +418,28 @@ SG_DIV_BASKET = {
     "C52.SI": "ComfortDelGro", "V03.SI": "Venture Corp",
 }
 
-@st.cache_data(ttl=86400)  # dividend history barely changes day to day
+def _yf_retry(fn, retries=3, backoff=1.5):
+    """yfinance/Yahoo Finance is well known to rate-limit or transiently block requests from
+    cloud-hosted IPs (Streamlit Community Cloud, AWS, GCP etc.) far more readily than
+    residential/dev IPs - a single 403 on a bad attempt is normal, not a sign the ticker is
+    actually unavailable. Retry a few times with backoff before giving up."""
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return fn()
+        except Exception as e:
+            last_exc = e
+            time.sleep(backoff * (attempt + 1))
+    raise last_exc if last_exc else RuntimeError("yfinance call failed")
+
+# Short TTL is deliberate: a transient rate-limit/block (see _yf_retry) would otherwise get
+# cached as "this ticker has no data" for the full TTL, silently dropping it from every chart
+# until the cache expires - a 1hr window means a bad run self-heals within the hour instead of
+# a full day.
+@st.cache_data(ttl=3600)
 def _fetch_dividends(ticker: str) -> pd.Series:
     try:
-        div = yf.Ticker(ticker).dividends
+        div = _yf_retry(lambda: yf.Ticker(ticker).dividends)
         if div.empty:
             return pd.Series(dtype=float)
         div.index = pd.to_datetime(div.index).tz_localize(None)
@@ -429,14 +447,14 @@ def _fetch_dividends(ticker: str) -> pd.Series:
     except Exception:
         return pd.Series(dtype=float)
 
-@st.cache_data(ttl=86400)
+@st.cache_data(ttl=3600)
 def _fetch_shares_history(ticker: str) -> pd.Series:
     """Historical shares-outstanding checkpoints, where yfinance has them. Coverage is very
     uneven - REITs (which issue new units often) tend to have dense multi-year histories;
     banks/industrials often only have a couple of recent points. Only trusted (see
     get_sg_dividend_payouts) when there are enough points to mean something."""
     try:
-        shares = yf.Ticker(ticker).get_shares_full(start="2010-01-01")
+        shares = _yf_retry(lambda: yf.Ticker(ticker).get_shares_full(start="2010-01-01"))
         if shares is None or len(shares) == 0:
             return pd.Series(dtype=float)
         shares.index = pd.to_datetime(shares.index).tz_localize(None)
@@ -444,31 +462,38 @@ def _fetch_shares_history(ticker: str) -> pd.Series:
     except Exception:
         return pd.Series(dtype=float)
 
-@st.cache_data(ttl=86400)
+@st.cache_data(ttl=3600)
 def _fetch_shares_current(ticker: str):
     try:
-        return yf.Ticker(ticker).info.get("sharesOutstanding")
+        return _yf_retry(lambda: yf.Ticker(ticker).info.get("sharesOutstanding"))
     except Exception:
         return None
 
-@st.cache_data(ttl=86400)
-def get_sg_dividend_payouts(years_back=11) -> pd.DataFrame:
+@st.cache_data(ttl=3600)
+def get_sg_dividend_payouts(years_back=11) -> tuple[pd.DataFrame, list[str]]:
     """Nominal S$ paid out per ex-dividend event = dividend/share x shares outstanding at the
     time. Uses the nearest known historical share-count checkpoint where enough of them exist
     (>=20 points - otherwise treat as too sparse to trust for point-in-time lookups) and falls
     back to today's share count otherwise. This is a real approximation, not a reconciliation
     against company filings - most accurate for recent years and for the REITs with dense
     share-count history, least accurate for older dividends from tickers whose share count has
-    since moved a lot (buybacks or unit issuance)."""
+    since moved a lot (buybacks or unit issuance).
+
+    Returns (payouts_df, missing_tickers) - missing_tickers lists any basket member that came
+    back with no usable data this run (e.g. DBS Group vanishing from a "top payer" ranking
+    after a transient fetch failure), so the UI can surface it instead of silently omitting it."""
     cutoff = pd.Timestamp.today() - pd.DateOffset(years=years_back)
     rows = []
+    missing = []
     for ticker, name in SG_DIV_BASKET.items():
         div = _fetch_dividends(ticker)
         if div.empty:
+            missing.append(name)
             continue
         cur_shares = _fetch_shares_current(ticker)
         hist = _fetch_shares_history(ticker)
         use_hist = len(hist) >= 20
+        got_any = False
         for date, amt in div.items():
             if date < cutoff:
                 continue
@@ -479,14 +504,17 @@ def get_sg_dividend_payouts(years_back=11) -> pd.DataFrame:
                 shares = cur_shares
             if shares is None:
                 continue
+            got_any = True
             rows.append({"ticker": ticker, "name": name, "date": date, "amount": float(amt),
                          "shares": shares, "payout_sgd_m": float(amt) * shares / 1e6})
+        if not got_any:
+            missing.append(name)
     if not rows:
-        return pd.DataFrame(columns=["ticker", "name", "date", "amount", "shares", "payout_sgd_m", "month", "year"])
+        return pd.DataFrame(columns=["ticker", "name", "date", "amount", "shares", "payout_sgd_m", "month", "year"]), missing
     df = pd.DataFrame(rows)
     df["month"] = df["date"].dt.month
     df["year"] = df["date"].dt.year
-    return df
+    return df, missing
 
 # ── Date range ────────────────────────────────────────────────────────────────
 st.title("🇸🇬 SG Macro Dashboard")
@@ -1092,7 +1120,14 @@ with tabs[4]:
     div_years_back = st.slider("Years to include in average", min_value=1, max_value=15, value=10, key="sg_div_years")
 
     with st.spinner("Loading dividend history for 20 SGX stocks…"):
-        div_payouts = get_sg_dividend_payouts(years_back=div_years_back)
+        div_payouts, missing_tickers = get_sg_dividend_payouts(years_back=div_years_back)
+
+    if missing_tickers:
+        st.warning(f"⚠️ No data came back for {len(missing_tickers)} of {len(SG_DIV_BASKET)} stocks this run "
+                   f"(likely a transient yfinance/Yahoo Finance rate-limit — this happens more on cloud-hosted "
+                   f"deployments than locally): **{', '.join(missing_tickers)}**. Charts below reflect only the "
+                   f"stocks that loaded; a rerun in a bit should pick the rest back up (results are cached for "
+                   f"just 1 hour specifically so this self-heals quickly).")
 
     if div_payouts.empty:
         st.warning("Could not load dividend data.")
