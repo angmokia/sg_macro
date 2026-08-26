@@ -9,6 +9,7 @@ import datetime
 import io
 import time
 import re
+import yfinance as yf
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="SG Macro Dashboard", layout="wide", page_icon="🇸🇬")
@@ -402,6 +403,91 @@ def get_mps_dates():
     except Exception:
         return MPS_FALLBACK
 
+# ── Dividend seasonality (SGX blue chips + major S-REITs, via yfinance) ─────────
+# yfinance covers SGX tickers directly (".SI" suffix) - confirmed live for this basket.
+# Not from SingStat/MAS; this is equities/corporate-actions data, a different domain from
+# the rest of this dashboard.
+SG_DIV_BASKET = {
+    "D05.SI": "DBS Group", "O39.SI": "OCBC Bank", "U11.SI": "UOB", "Z74.SI": "Singtel",
+    "C6L.SI": "Singapore Airlines", "C38U.SI": "CapitaLand Integrated Comm. Trust",
+    "A17U.SI": "Ascendas REIT", "BUOU.SI": "Frasers Logistics & Comm. Trust",
+    "ME8U.SI": "Mapletree Industrial Trust", "N2IU.SI": "Mapletree Pan Asia Comm. Trust",
+    "M44U.SI": "Mapletree Logistics Trust", "C09.SI": "City Developments",
+    "F34.SI": "Wilmar International", "G13.SI": "Genting Singapore", "BN4.SI": "Keppel Ltd",
+    "S68.SI": "SGX", "Y92.SI": "Thai Beverage", "U96.SI": "Sembcorp Industries",
+    "C52.SI": "ComfortDelGro", "V03.SI": "Venture Corp",
+}
+
+@st.cache_data(ttl=86400)  # dividend history barely changes day to day
+def _fetch_dividends(ticker: str) -> pd.Series:
+    try:
+        div = yf.Ticker(ticker).dividends
+        if div.empty:
+            return pd.Series(dtype=float)
+        div.index = pd.to_datetime(div.index).tz_localize(None)
+        return div
+    except Exception:
+        return pd.Series(dtype=float)
+
+@st.cache_data(ttl=86400)
+def _fetch_shares_history(ticker: str) -> pd.Series:
+    """Historical shares-outstanding checkpoints, where yfinance has them. Coverage is very
+    uneven - REITs (which issue new units often) tend to have dense multi-year histories;
+    banks/industrials often only have a couple of recent points. Only trusted (see
+    get_sg_dividend_payouts) when there are enough points to mean something."""
+    try:
+        shares = yf.Ticker(ticker).get_shares_full(start="2010-01-01")
+        if shares is None or len(shares) == 0:
+            return pd.Series(dtype=float)
+        shares.index = pd.to_datetime(shares.index).tz_localize(None)
+        return shares[~shares.index.duplicated(keep="last")].sort_index()
+    except Exception:
+        return pd.Series(dtype=float)
+
+@st.cache_data(ttl=86400)
+def _fetch_shares_current(ticker: str):
+    try:
+        return yf.Ticker(ticker).info.get("sharesOutstanding")
+    except Exception:
+        return None
+
+@st.cache_data(ttl=86400)
+def get_sg_dividend_payouts(years_back=11) -> pd.DataFrame:
+    """Nominal S$ paid out per ex-dividend event = dividend/share x shares outstanding at the
+    time. Uses the nearest known historical share-count checkpoint where enough of them exist
+    (>=20 points - otherwise treat as too sparse to trust for point-in-time lookups) and falls
+    back to today's share count otherwise. This is a real approximation, not a reconciliation
+    against company filings - most accurate for recent years and for the REITs with dense
+    share-count history, least accurate for older dividends from tickers whose share count has
+    since moved a lot (buybacks or unit issuance)."""
+    cutoff = pd.Timestamp.today() - pd.DateOffset(years=years_back)
+    rows = []
+    for ticker, name in SG_DIV_BASKET.items():
+        div = _fetch_dividends(ticker)
+        if div.empty:
+            continue
+        cur_shares = _fetch_shares_current(ticker)
+        hist = _fetch_shares_history(ticker)
+        use_hist = len(hist) >= 20
+        for date, amt in div.items():
+            if date < cutoff:
+                continue
+            if use_hist:
+                prior = hist[hist.index <= date]
+                shares = prior.iloc[-1] if len(prior) > 0 else cur_shares
+            else:
+                shares = cur_shares
+            if shares is None:
+                continue
+            rows.append({"ticker": ticker, "name": name, "date": date, "amount": float(amt),
+                         "shares": shares, "payout_sgd_m": float(amt) * shares / 1e6})
+    if not rows:
+        return pd.DataFrame(columns=["ticker", "name", "date", "amount", "shares", "payout_sgd_m", "month", "year"])
+    df = pd.DataFrame(rows)
+    df["month"] = df["date"].dt.month
+    df["year"] = df["date"].dt.year
+    return df
+
 # ── Date range ────────────────────────────────────────────────────────────────
 st.title("🇸🇬 SG Macro Dashboard")
 st.caption("Data: SingStat Table Builder · MAS Bonds & Bills / Domestic Interest Rates · No NBER-style "
@@ -533,7 +619,8 @@ tabs = st.tabs([
     "Prices",
     "Growth & Labour",
     "Trade & Production",
-    "Monetary Policy",
+    "SGD & Rates",
+    "Dividends",
     "Economic Calendar",
 ])
 
@@ -761,10 +848,10 @@ with tabs[2]:
     ])
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 4 — Monetary Policy
+# TAB 4 — SGD & Rates
 # ════════════════════════════════════════════════════════════════════════════════
 with tabs[3]:
-    st.header("Monetary Policy")
+    st.header("SGD & Rates")
     st.info("No Fed-Funds-style hike/cut probability section here — MAS doesn't set a policy interest rate. "
              "It manages monetary policy via the S\\$NEER exchange-rate band, reviewed at scheduled Monetary "
              "Policy Statements (see the Economic Calendar tab), so there's no futures-implied-probability "
@@ -992,9 +1079,75 @@ with tabs[3]:
     csv_download(upcoming_cal, "sgs_upcoming_issuance")
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 5 — Economic Calendar
+# TAB 5 — Dividends
 # ════════════════════════════════════════════════════════════════════════════════
 with tabs[4]:
+    st.header("Dividends")
+    st.caption("Dividend seasonality for a 20-stock basket of SGX blue chips and major S-REITs — a different "
+               "data domain from the rest of this dashboard (equities/corporate actions via yfinance, not "
+               "SingStat or MAS).")
+
+    MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+    with st.spinner("Loading dividend history for 20 SGX stocks…"):
+        div_payouts = get_sg_dividend_payouts()
+
+    if div_payouts.empty:
+        st.warning("Could not load dividend data.")
+    else:
+        st.info("**Methodology caveat:** nominal payout = dividend/share x shares outstanding at the time. "
+                "Historical share counts from yfinance only have dense coverage for some tickers (mostly the "
+                "REITs, which issue new units often); the rest fall back to today's share count applied across "
+                "their whole history. Treat magnitudes as directionally right, not to-the-dollar precise — "
+                "especially older REIT payouts from before their unit count grew.")
+
+        n_years = div_payouts["year"].nunique()
+        month_avg = div_payouts.groupby("month")["payout_sgd_m"].sum().reindex(range(1, 13), fill_value=0) / n_years
+
+        # Seasonality - average nominal payout per calendar month, across the whole basket
+        fig_div_month = go.Figure()
+        fig_div_month.add_trace(go.Bar(x=MONTH_NAMES, y=month_avg.values,
+                                        marker_color="#ef5350",
+                                        hovertemplate="%{x}: S$%{y:,.0f}M<extra></extra>"))
+        fig_div_month.update_layout(**base_layout(f"Average Nominal Payout by Month (S$M/yr, {n_years}y basket average)"))
+        fig_div_month.update_yaxes(title="S$ Million")
+
+        # Same data by year - is the pattern stable, or drifting?
+        heatmap_df = div_payouts.pivot_table(index="year", columns="month", values="payout_sgd_m", aggfunc="sum").fillna(0)
+        heatmap_df = heatmap_df.reindex(columns=range(1, 13), fill_value=0)
+        fig_div_heatmap = go.Figure(go.Heatmap(
+            z=heatmap_df.values, x=MONTH_NAMES, y=[str(y) for y in heatmap_df.index],
+            colorscale=[[0, PLOT_BG], [1, "#ef5350"]],
+            hovertemplate="%{y} %{x}: S$%{z:,.0f}M<extra></extra>",
+            colorbar=dict(title="S$M"),
+        ))
+        fig_div_heatmap.update_layout(**base_layout("Nominal Payout by Month & Year (S$M)", height=380))
+
+        # Which stocks actually drive the total
+        by_ticker = (div_payouts.groupby("name")["payout_sgd_m"].sum() / n_years).sort_values(ascending=True)
+        fig_div_ticker = go.Figure(go.Bar(
+            x=by_ticker.values, y=by_ticker.index, orientation="h", marker_color="#90a4d4",
+            hovertemplate="%{y}: S$%{x:,.0f}M<extra></extra>",
+        ))
+        fig_div_ticker.update_layout(**base_layout("Average Nominal Payout by Stock (S$M/yr)", height=460))
+        fig_div_ticker.update_xaxes(title="S$ Million")
+
+        render_two_col([
+            ("Payout by Month", fig_div_month, month_avg.reset_index()),
+            ("Payout by Month & Year", fig_div_heatmap, heatmap_df.reset_index()),
+            ("Payout by Stock", fig_div_ticker, by_ticker.reset_index()),
+        ])
+
+        top3 = by_ticker.sort_values(ascending=False).head(3)
+        top3_share = top3.sum() / by_ticker.sum() * 100
+        st.caption(f"The three biggest payers ({', '.join(top3.index)}) account for {top3_share:.0f}% of total "
+                   f"nominal payout across this basket — the May/August seasonality above is substantially a "
+                   f"bank-earnings-calendar effect, not a broad market-wide pattern.")
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 6 — Economic Calendar
+# ════════════════════════════════════════════════════════════════════════════════
+with tabs[5]:
     st.header("Economic Calendar")
     st.caption("Monetary Policy Statement dates (MAS reviews the S\\$NEER policy band quarterly, not an interest "
                "rate) + upcoming SGS/T-Bill auctions. No SingStat release-date-schedule API was confirmed "
