@@ -1089,8 +1089,10 @@ with tabs[4]:
 
     MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
+    div_years_back = st.slider("Years to include in average", min_value=1, max_value=15, value=10, key="sg_div_years")
+
     with st.spinner("Loading dividend history for 20 SGX stocks…"):
-        div_payouts = get_sg_dividend_payouts()
+        div_payouts = get_sg_dividend_payouts(years_back=div_years_back)
 
     if div_payouts.empty:
         st.warning("Could not load dividend data.")
@@ -1118,6 +1120,7 @@ with tabs[4]:
         fig_div_heatmap = go.Figure(go.Heatmap(
             z=heatmap_df.values, x=MONTH_NAMES, y=[str(y) for y in heatmap_df.index],
             colorscale=[[0, PLOT_BG], [1, "#ef5350"]],
+            text=heatmap_df.values, texttemplate="%{text:,.0f}", textfont=dict(size=10, color="#e0e0e0"),
             hovertemplate="%{y} %{x}: S$%{z:,.0f}M<extra></extra>",
             colorbar=dict(title="S$M"),
         ))
@@ -1143,6 +1146,11 @@ with tabs[4]:
         st.caption(f"The three biggest payers ({', '.join(top3.index)}) account for {top3_share:.0f}% of total "
                    f"nominal payout across this basket — the May/August seasonality above is substantially a "
                    f"bank-earnings-calendar effect, not a broad market-wide pattern.")
+
+    st.markdown('<div class="section-header">Basket Universe</div>', unsafe_allow_html=True)
+    universe_df = pd.DataFrame(list(SG_DIV_BASKET.items()), columns=["Ticker", "Company"]).sort_values("Company")
+    st.dataframe(universe_df, use_container_width=True, hide_index=True)
+    csv_download(universe_df, "sg_dividend_universe")
 
 # ════════════════════════════════════════════════════════════════════════════════
 # TAB 6 — Economic Calendar
