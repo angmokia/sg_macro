@@ -142,6 +142,132 @@ def fetch_singstat(resource_id: str, label: str, series_no="1", n_periods=200) -
         st.warning(f"Could not load {label} ({resource_id}): {e}")
         return pd.DataFrame()
 
+# ── CPI breakdown: SingStat index levels x SingStat official 2024-base weights ────────
+# Same resourceId (M213751) already used for headline CPI carries ~200 series rows (divisions,
+# groups, classes) - fetched here in ONE call. The table holds indices only, not basket weights,
+# so the weights below (per 10,000) are hardcoded from SingStat's own "Rebasing of the Consumer
+# Price Index (2024 as Base Year)" information paper, Appendix III (S-COICOP 2022). Verified
+# 2026-09-20: the 10 division weights sum to exactly 10,000 and reproduce headline CPI to 0.00
+# index points from Jan 2024 on, so contributions to YoY are exact from Jan 2025 (the first month
+# whose year-ago value sits inside the 2024-base window; earlier history is chain-linked from
+# the old 2019 basket and does not satisfy the identity). Refresh CPI_W_SG at the next rebasing.
+CPI_W_SG = {
+    "1.0": 2042,
+    "1.02": 165,
+    "1.03": 2938,
+    "1.04": 547,
+    "1.05": 1008,
+    "1.06": 1307,
+    "1.07": 381,
+    "1.08": 595,
+    "1.09": 579,
+    "1.10": 438,
+    "1.01": 651,
+    "1.11.1": 585,
+    "1.11.3": 707,
+    "1.03.1.2": 2138,
+    "1.03.1.1": 294,
+    "1.03.1.3": 224,
+    "1.03.2": 282,
+    "1.04.1": 128,
+    "1.04.3": 101,
+    "1.04.6.2": 245,
+    "1.02.1": 129,
+    "1.05.2": 428,
+    "1.05.3": 238,
+    "1.05.5": 225,
+    "1.06.1.1": 459,
+    "1.06.1.5": 174,
+    "1.06.2.1": 138,
+    "1.06.2.2": 108,
+    "1.06.3.1": 129,
+    "1.07.3": 287,
+    "1.08.7.3": 206,
+    "1.08.7.1": 103,
+    "1.08.4": 144,
+    "1.09.1": 391,
+    "1.09.2": 184,
+    "1.10.1": 211,
+    "1.03.2.3": 179,
+    "1.01.1.1": 14,
+    "1.01.7": 82,
+    "1.01.2": 101,
+    "1.06.1": 906,
+    "1.03.1": 2656,
+}
+CPI_NAME_SG = {
+    "1.0": "Food",
+    "1.02": "Clothing & Footwear",
+    "1.03": "Housing & Utilities",
+    "1.04": "Household Durables & Services",
+    "1.05": "Health",
+    "1.06": "Transport",
+    "1.07": "Info & Communication",
+    "1.08": "Recreation, Sport & Culture",
+    "1.09": "Education",
+    "1.10": "Miscellaneous",
+    "1.01": "Food excl. F&B Serving",
+    "1.11.1": "Restaurants, Cafes & Pubs",
+    "1.11.3": "Hawker Centres & Food Courts",
+    "1.03.1.2": "Imputed Rentals",
+    "1.03.1.1": "Actual Rentals",
+    "1.03.1.3": "Housing Maintenance & Repairs",
+    "1.03.2": "Utilities & Other Fuels",
+    "1.04.1": "Furniture & Furnishings",
+    "1.04.3": "Household Appliances",
+    "1.04.6.2": "Domestic & Household Services",
+    "1.02.1": "Clothing",
+    "1.05.2": "Outpatient Care",
+    "1.05.3": "Inpatient Care",
+    "1.05.5": "Health Insurance",
+    "1.06.1.1": "Motor Cars",
+    "1.06.1.5": "Petrol",
+    "1.06.2.1": "Bus & Train Fares",
+    "1.06.2.2": "Point-to-Point Transport",
+    "1.06.3.1": "Airfares",
+    "1.07.3": "Info & Comm Services",
+    "1.08.7.3": "Package Holidays",
+    "1.08.7.1": "Hotels",
+    "1.08.4": "Recreational Services",
+    "1.09.1": "General, Vocational & Higher Ed.",
+    "1.09.2": "Private Tuition & Courses",
+    "1.10.1": "Personal Care",
+    "1.03.2.3": "Electricity",
+    "1.01.1.1": "Rice",
+    "1.01.7": "Vegetables",
+    "1.01.2": "Meat",
+    "1.06.1": "Private Transport",
+    "1.03.1": "Accommodation",
+}
+CPI_MAIN_SG = ["1.0", "1.02", "1.03", "1.04", "1.05", "1.06", "1.07", "1.08", "1.09", "1.10"]
+# Direct classes of each division that are >=1% of the basket (not exhaustive per division).
+CPI_KIDS_SG = {"1.0": ["1.01", "1.11.1", "1.11.3"], "1.02": ["1.02.1"], "1.03": ["1.03.1.2", "1.03.1.1", "1.03.1.3", "1.03.2"], "1.04": ["1.04.1", "1.04.3", "1.04.6.2"], "1.05": ["1.05.2", "1.05.3", "1.05.5"], "1.06": ["1.06.1.1", "1.06.1.5", "1.06.2.1", "1.06.2.2", "1.06.3.1"], "1.07": ["1.07.3"], "1.08": ["1.08.7.3", "1.08.7.1", "1.08.4"], "1.09": ["1.09.1", "1.09.2"], "1.10": ["1.10.1"]}
+# Price-sensitive areas: volatile, policy-driven (COE, utility tariffs) or high-weight items.
+# Some overlap each other (Private Transport / Motor Cars / Petrol, Accommodation / Rentals) -
+# by design, not meant to be summed.
+CPI_SENSITIVE_SG = ["1.01.1.1", "1.01.2", "1.01.7", "1.11.3", "1.11.1", "1.03.1.1", "1.03.1.2", "1.03.2.3", "1.06.1.1", "1.06.1.5", "1.06.3.1", "1.08.7.3", "1.08.7.1", "1.06.1", "1.03.1"]
+CPI_GROUP_COLORS_SG = ["#ef5350", "#ff9800", "#ffd54f", "#9ccc65", "#26a69a", "#4fc3f7", "#5c9eff", "#ba68c8", "#f06292", "#8a94a6"]
+
+@st.cache_data(ttl=21600)
+def fetch_singstat_cpi_components(n_periods=180) -> pd.DataFrame:
+    """Index levels for headline + every series in CPI_W_SG, one API call. Wide frame: date x series_no."""
+    codes = ["1"] + list(CPI_W_SG)
+    try:
+        r = requests.get(f"{SINGSTAT_BASE}/M213751", headers=HEADERS, timeout=60,
+                          params={"seriesNoORrowNo": ",".join(codes), "limit": n_periods * len(codes), "sortBy": "key desc"})
+        r.raise_for_status()
+        cols = {}
+        for row in r.json()["Data"]["row"]:
+            s = {_parse_singstat_period(c["key"]): _to_float(c["value"]) for c in row["columns"]}
+            s = pd.Series(s).sort_index()
+            cols[row["seriesNo"]] = s[s.index.notna()]
+        df = pd.DataFrame(cols)
+        df.index.name = "date"
+        return df
+    except Exception as e:
+        st.warning(f"Could not load CPI components (SingStat M213751): {e}")
+        return pd.DataFrame()
+
 # ── MAS Bonds & Bills API (undocumented but public JSON, no key — verified live) ─
 # This backs mas.gov.sg's own bonds-and-bills pages (found via their JS bundle),
 # not an officially documented endpoint - could change without notice, but it's
@@ -737,6 +863,111 @@ with tabs[0]:
         ("CPI Components History", fig_cpi_comp_hist, pd.concat([cpi_components_sg[l] for l, _ in CPI_GROUPS_SG], axis=1)),
         ("CPI Components Snapshot", fig_cpi_comp_snap, comp_df_sg),
     ])
+
+    st.markdown('<div class="section-header">CPI Breakdown — Price-Sensitive Drivers</div>', unsafe_allow_html=True)
+    with st.spinner("Loading CPI components from SingStat…"):
+        cpi_idx_sg = fetch_singstat_cpi_components()
+    if cpi_idx_sg.empty or "1" not in cpi_idx_sg.columns:
+        st.info("CPI component data unavailable right now.")
+    else:
+        cpi_all_sg = cpi_idx_sg["1"]
+        cpi_yoy_sg = cpi_idx_sg.pct_change(12) * 100
+        cpi_mom_sg = cpi_idx_sg.pct_change(1) * 100
+        CONTRIB_FROM_SG = pd.Timestamp("2025-01-01")  # first month whose year-ago value is inside the 2024 base
+
+        def _cpi_contrib_sg(code):
+            # pp of headline YoY: weight x change in the item's index / prior-year headline index.
+            c = CPI_W_SG[code] / 10000 * (cpi_idx_sg[code] - cpi_idx_sg[code].shift(12)) / cpi_all_sg.shift(12) * 100
+            return c[c.index >= CONTRIB_FROM_SG]
+
+        def _last_sg(s):
+            s = s.dropna()
+            return s.iloc[-1] if not s.empty else np.nan
+
+        cpi_lab_sg = cpi_all_sg.dropna().index[-1].strftime("%b %Y")
+        st.caption(f"Latest CPI month: {cpi_lab_sg}. Index levels from SingStat (2024=100); basket weights are SingStat's official 2024-base "
+                   f"weights. Contribution = weight x change in the item's index / prior-year headline index - group contributions sum to "
+                   f"headline YoY exactly. Contributions start Jan 2025, the first month whose year-ago value is inside the 2024 base "
+                   f"(earlier history is chain-linked from the old basket). Imputed rentals are ~21% of the basket; MAS Core excludes "
+                   f"Accommodation and Private Transport.")
+
+        fig_sg_contrib = go.Figure()
+        contrib_cols_sg = {}
+        for i, g in enumerate(CPI_MAIN_SG):
+            s_c = clip(_cpi_contrib_sg(g).dropna().round(3))
+            contrib_cols_sg[f"{CPI_NAME_SG[g]} (pp)"] = s_c
+            fig_sg_contrib.add_trace(go.Bar(x=s_c.index, y=s_c, name=f"{CPI_NAME_SG[g]} ({CPI_W_SG[g] / 100:.1f}%)",
+                                             marker_color=CPI_GROUP_COLORS_SG[i]))
+        h_c = clip(cpi_yoy_sg["1"].dropna().round(3))
+        h_c = h_c[h_c.index >= CONTRIB_FROM_SG]
+        contrib_cols_sg["Headline CPI YoY %"] = h_c
+        fig_sg_contrib.add_trace(go.Scatter(x=h_c.index, y=h_c, name="Headline CPI YoY", mode="lines",
+                                             line=dict(color="#ffffff", width=2)))
+        fig_sg_contrib.update_layout(**base_layout("Contribution to CPI YoY by Division (pp)"))
+        fig_sg_contrib.update_layout(barmode="relative")
+        fig_sg_contrib.update_yaxes(ticksuffix="pp")
+
+        sens_lines_sg = [("1.06.1.5", "#ba68c8"), ("1.03.2.3", "#ff9800"), ("1.06.3.1", "#4fc3f7"), ("1.06.1.1", "#ef5350"),
+                         ("1.11.3", "#ffd54f"), ("1.08.7.3", "#f06292"), ("1.03.1.1", "#9ccc65")]
+        fig_sg_sens = go.Figure()
+        sens_cols_sg = {}
+        for code, color in sens_lines_sg:
+            s_y = clip(cpi_yoy_sg[code].dropna().round(3))
+            sens_cols_sg[f"{CPI_NAME_SG[code]} YoY %"] = s_y
+            fig_sg_sens.add_trace(go.Scatter(x=s_y.index, y=s_y, mode="lines", line=dict(color=color, width=1.6),
+                                              name=f"{CPI_NAME_SG[code]} ({CPI_W_SG[code] / 100:.1f}%)"))
+        fig_sg_sens.add_hline(y=0, line_dash="dot", line_color="#555")
+        fig_sg_sens.update_layout(**base_layout("Price-Sensitive Areas — YoY %"))
+        fig_sg_sens.update_yaxes(ticksuffix="%")
+
+        render_two_col([
+            ("SG CPI Contribution by Division", fig_sg_contrib, pd.DataFrame(contrib_cols_sg)),
+            ("SG CPI Price-Sensitive YoY", fig_sg_sens, pd.DataFrame(sens_cols_sg)),
+        ])
+
+        snap_rows_sg = []
+        for g in CPI_MAIN_SG:
+            snap_rows_sg.append({"Component": f"{CPI_NAME_SG[g].upper()} ({CPI_W_SG[g] / 100:.1f}%)",
+                                 "YoY %": _last_sg(cpi_yoy_sg[g]), "MoM %": _last_sg(cpi_mom_sg[g]), "is_parent": True})
+            for k in CPI_KIDS_SG[g]:
+                snap_rows_sg.append({"Component": f"     {CPI_NAME_SG[k]} ({CPI_W_SG[k] / 100:.1f}%)",
+                                     "YoY %": _last_sg(cpi_yoy_sg[k]), "MoM %": _last_sg(cpi_mom_sg[k]), "is_parent": False})
+        snap_df_sg = pd.DataFrame(snap_rows_sg).iloc[::-1]
+        fig_sg_snap = go.Figure()
+        fig_sg_snap.add_trace(go.Bar(y=snap_df_sg["Component"], x=snap_df_sg["YoY %"].round(2), name="YoY %", orientation="h",
+                                      marker_color=["#1f8f6b" if p else "#26a69a" for p in snap_df_sg["is_parent"]]))
+        fig_sg_snap.add_trace(go.Bar(y=snap_df_sg["Component"], x=snap_df_sg["MoM %"].round(2), name="MoM %", orientation="h",
+                                      marker_color=["#3568c9" if p else "#80cbc4" for p in snap_df_sg["is_parent"]]))
+        fig_sg_snap.update_layout(**base_layout(f"CPI Components — Divisions + Classes ({cpi_lab_sg})", height=900))
+        fig_sg_snap.update_layout(barmode="group")
+        fig_sg_snap.update_xaxes(ticksuffix="%")
+        fig_sg_snap.update_yaxes(tickfont=dict(size=10))
+
+        drv_sg = pd.DataFrame({"code": CPI_SENSITIVE_SG})
+        drv_sg["Item"] = drv_sg["code"].map(CPI_NAME_SG)
+        drv_sg["Weight %"] = drv_sg["code"].map(lambda c: CPI_W_SG[c] / 100)
+        drv_sg["YoY %"] = [_last_sg(cpi_yoy_sg[c]) for c in CPI_SENSITIVE_SG]
+        drv_sg["YoY 3M ago %"] = [cpi_yoy_sg[c].dropna().iloc[-4] if len(cpi_yoy_sg[c].dropna()) > 3 else np.nan for c in CPI_SENSITIVE_SG]
+        drv_sg["Contribution (pp)"] = [_last_sg(_cpi_contrib_sg(c)) for c in CPI_SENSITIVE_SG]
+        drv_sg = drv_sg.sort_values("Contribution (pp)")
+        fig_sg_drv = go.Figure(go.Bar(
+            y=drv_sg["Item"], x=drv_sg["Contribution (pp)"].round(3), orientation="h",
+            marker_color=["#26a69a" if v >= 0 else "#ef5350" for v in drv_sg["Contribution (pp)"]],
+            text=[f"{v:+.2f}pp" for v in drv_sg["Contribution (pp)"]], textposition="outside"))
+        fig_sg_drv.update_layout(**base_layout(f"Price-Sensitive Drivers — Contribution ({cpi_lab_sg})", height=480))
+        fig_sg_drv.update_xaxes(ticksuffix="pp")
+        drv_table_sg = drv_sg.drop(columns="code").sort_values("Contribution (pp)", ascending=False).round(2)
+
+        col_snap_sg, col_drv_sg = st.columns(2)
+        with col_snap_sg:
+            st.plotly_chart(fig_sg_snap, use_container_width=True, key="chart_sg_cpi_snapshot")
+            csv_download(snap_df_sg.drop(columns="is_parent").iloc[::-1], "SG CPI Components Snapshot")
+        with col_drv_sg:
+            st.plotly_chart(fig_sg_drv, use_container_width=True, key="chart_sg_cpi_drivers")
+            st.dataframe(drv_table_sg, hide_index=True, use_container_width=True)
+            st.caption("Private Transport, Accommodation and their sub-items overlap (as do Hawker Centres / Restaurants "
+                       "within food serving) - contributions here are not meant to be added together.")
+            csv_download(drv_table_sg, "SG CPI Price-Sensitive Drivers")
 
 # ════════════════════════════════════════════════════════════════════════════════
 # TAB 2 — Growth & Labour
