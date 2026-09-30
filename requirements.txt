@@ -8,3 +8,4 @@ requests>=2.31
 yfinance>=0.2.40
 beautifulsoup4>=4.12
 lxml>=5.0
+scipy>=1.11
