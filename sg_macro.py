@@ -1453,15 +1453,8 @@ with tabs[0]:
             fwd_df[f"{lab} USD−SGD rate diff (pp)"] = f_["ru"] - f_["rs"]
         for c_, col in [("6M fwd pts (pips)", "#42a5f5"), ("12M fwd pts (pips)", "#26a69a")]:
             zline(fig_fwd, fwd_df[c_], c_, color=col, fmt=".0f")
-        vol3 = realized_vol(usdsgd, 63)
-        cv = pd.concat([fwd_df["12M USD−SGD rate diff (pp)"], vol3], axis=1, keys=["diff", "vol"]).dropna()
-        zline(fig_carry, cv["diff"], "Long USD/SGD carry (% p.a.)", color="#ff9800", unit="%")
-        zline(fig_carry, cv["diff"] / cv["vol"], "Carry / 3M realized vol", color="#90a4d4", yaxis="y2")
-        fwd_df["Carry/Vol (12M)"] = cv["diff"] / cv["vol"]
     fig_fwd.add_hline(y=0, line_dash="dot", line_color="#555")
     fig_fwd.update_layout(**base_layout("USD/SGD Implied Forward Points (SGS bills vs UST bills, CIP)"))
-    fig_carry.update_layout(**dual_axis_layout("USD/SGD Carry (12M rate differential) & Carry-to-Vol",
-                                               "Carry (% p.a.)", "Carry / Vol"))
 
     # MAS intervention proxy: FX reserves change in USD (removes USD/SGD translation effects)
     fig_resv = go.Figure()
@@ -1502,10 +1495,36 @@ with tabs[0]:
         ("USD-SGD Beta", fig_beta, clip(beta_df) if not beta_df.empty else None),
         ("USD-Asia Correlation", fig_corr, corr),
         ("S$NEER Model Weights", fig_w, neer_weights.to_frame("weight") if neer_weights is not None else None),
-        ("USD-SGD Forward Points", fig_fwd, clip(fwd_df) if not fwd_df.empty else None),
-        ("USD-SGD Carry", fig_carry, None),
-        ("MAS Intervention Proxy", fig_resv, clip(resv_df) if not resv_df.empty else None),
     ])
+
+    # Forward points + carry get their own row so the vol-window selector sits right above the
+    # carry chart it drives (render_two_col can't place widgets inside the grid).
+    CARRY_VOL_WINDOWS = {"1M": 21, "3M": 63, "6M": 126, "1Y": 252}
+    col_fwd, col_carry = st.columns(2)
+    with col_fwd:
+        st.plotly_chart(fig_fwd, use_container_width=True, key="chart_USD-SGD Forward Points")
+        if not fwd_df.empty:
+            csv_download(clip(fwd_df), "USD-SGD Forward Points")
+    with col_carry:
+        vol_win = st.radio("Realized vol window (carry-to-vol)", list(CARRY_VOL_WINDOWS), index=1,
+                           horizontal=True, key="carry_vol_window")
+        carry_df = pd.DataFrame()
+        if not fwd_df.empty:
+            rv = realized_vol(usdsgd, CARRY_VOL_WINDOWS[vol_win])
+            carry_df = pd.concat([fwd_df["12M USD−SGD rate diff (pp)"], rv], axis=1,
+                                 keys=["Carry (% p.a.)", f"{vol_win} realized vol (%)"]).dropna()
+            carry_df["Carry / Vol"] = carry_df["Carry (% p.a.)"] / carry_df[f"{vol_win} realized vol (%)"]
+            zline(fig_carry, carry_df["Carry (% p.a.)"], "Long USD/SGD carry (% p.a.)", color="#ff9800", unit="%")
+            zline(fig_carry, carry_df["Carry / Vol"], f"Carry / {vol_win} realized vol", color="#90a4d4", yaxis="y2")
+        fig_carry.update_layout(**dual_axis_layout(f"USD/SGD Carry (12M rate differential) & Carry-to-Vol ({vol_win} vol)",
+                                                   "Carry (% p.a.)", "Carry / Vol"))
+        st.plotly_chart(fig_carry, use_container_width=True, key="chart_USD-SGD Carry")
+        if not carry_df.empty:
+            csv_download(clip(carry_df), "USD-SGD Carry")
+
+    st.plotly_chart(fig_resv, use_container_width=True, key="chart_MAS Intervention Proxy")
+    if not resv_df.empty:
+        csv_download(clip(resv_df), "MAS Intervention Proxy")
     st.caption("Forward points are theoretical covered-interest-parity values from SGS vs UST bill yields - real "
                "dealer forwards also carry a cross-currency basis. Reserves change is measured in US\\$ to strip "
                "USD/SGD translation, but still includes valuation moves on non-USD assets and investment returns, so "
