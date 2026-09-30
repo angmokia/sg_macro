@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import streamlit as st
+import streamlit.components.v1 as components
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import requests
@@ -10,6 +11,8 @@ import io
 import time
 import re
 import yfinance as yf
+from concurrent.futures import ThreadPoolExecutor
+from scipy.optimize import nnls
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="SG Macro Dashboard", layout="wide", page_icon="🇸🇬")
@@ -26,6 +29,15 @@ st.markdown("""
                   text-transform: uppercase; margin-bottom: 3px; }
   .metric-value { font-size: 1.1rem; font-weight: 700; white-space: nowrap; }
   .metric-delta { font-size: 0.72rem; margin-top: 2px; }
+  .metric-z { font-size: 0.64rem; margin-top: 3px; display: flex; justify-content: center; gap: 8px; }
+  .metric-asof { font-size: 0.6rem; color: #5f6b7e; margin-top: 2px; }
+  .band-wrap { background: #161b26; border: 1px solid #2a2f3e; border-radius: 8px; padding: 14px 18px; }
+  .band-track { position: relative; height: 14px; border-radius: 7px; margin: 22px 0 6px;
+                background: linear-gradient(90deg, #ef5350 0%, #3a3f4e 30%, #3a3f4e 70%, #26a69a 100%); }
+  .band-mid { position: absolute; left: 50%; top: -4px; width: 2px; height: 22px; background: #e0e0e0; }
+  .band-dot { position: absolute; top: -5px; width: 24px; height: 24px; margin-left: -12px; border-radius: 50%;
+              background: #ff9800; border: 3px solid #0e1117; }
+  .band-scale { display: flex; justify-content: space-between; font-size: 0.66rem; color: #8a94a6; }
   .positive { color: #26a69a; }
   .negative { color: #ef5350; }
   .neutral  { color: #e0e0e0; }
@@ -78,7 +90,7 @@ def render_two_col(charts):
     while i < n:
         if i == n - 1 and n % 2 != 0:
             item = charts[i]
-            st.plotly_chart(item[1], use_container_width=True)
+            st.plotly_chart(item[1], use_container_width=True, key=f"chart_{item[0]}")
             if len(item) > 2 and item[2] is not None:
                 csv_download(item[2], item[0])
             i += 1
@@ -86,10 +98,149 @@ def render_two_col(charts):
             c1, c2 = st.columns(2)
             for col, item in [(c1, charts[i]), (c2, charts[i+1])]:
                 with col:
-                    st.plotly_chart(item[1], use_container_width=True)
+                    st.plotly_chart(item[1], use_container_width=True, key=f"chart_{item[0]}")
                     if len(item) > 2 and item[2] is not None:
                         csv_download(item[2], item[0])
             i += 2
+
+# ── Z-scores (same conventions as usa_macro.py's summary bar) ──────────────────
+# A 1-observation rolling window can't produce a std, so lower-frequency series use the
+# closest honest equivalent windows instead of forcing the daily 1M/3M/1Y labels onto them.
+Z_WINDOWS = {
+    "D": {"1M": 21, "3M": 63, "1Y": 252},        # trading days
+    "W": {"3M": 13, "6M": 26, "1Y": 52},         # weeks (MAS S$NEER is weekly)
+    "M": {"3M": 3, "12M": 12, "36M": 36},        # months
+    "Q": {"4Q": 4, "8Q": 8, "20Q": 20},          # quarters (GDP, unemployment)
+}
+Z_HOVER_WINDOW = {"D": 252, "W": 52, "M": 36, "Q": 20}
+Z_HOVER_LABEL = {"D": "1Y", "W": "1Y", "M": "36M", "Q": "20Q"}
+
+def _zscores(series, windows):
+    out = {}
+    series = series.dropna()
+    for label, window in windows.items():
+        if len(series) <= window + 1:
+            out[label] = None
+            continue
+        z = (series - series.rolling(window).mean()) / series.rolling(window).std()
+        v = z.iloc[-1]
+        out[label] = float(v) if pd.notna(v) and np.isfinite(v) else None
+    return out
+
+def _zroll(series: pd.Series, window: int) -> pd.Series:
+    """Full rolling z-score history (each point vs its own trailing window) - used as hover
+    customdata so every point on a chart shows its own z-score, same as usa_macro's _z1y."""
+    clean = series.dropna()
+    return (clean - clean.rolling(window).mean()) / clean.rolling(window).std()
+
+def _value_months_ago(s: pd.Series, months=1):
+    """Value at-or-before exactly N calendar months before the latest date - a true 1M change
+    for daily/weekly series (iloc[-2] on a daily series is just the previous day)."""
+    v = s.asof(s.index[-1] - pd.DateOffset(months=months))
+    return float(v) if pd.notna(v) else None
+
+def _change_over(s: pd.Series, offset):
+    s = s.dropna()
+    if s.empty:
+        return np.nan
+    prev = s.asof(s.index[-1] - offset)
+    return float(s.iloc[-1] - prev) if pd.notna(prev) else np.nan
+
+def _pctile(s: pd.Series, years: int):
+    s = s.dropna()
+    if s.empty:
+        return np.nan
+    w = s[s.index >= s.index[-1] - pd.DateOffset(years=years)]
+    return float((w <= w.iloc[-1]).mean() * 100) if len(w) > 20 else np.nan
+
+def zline(fig, s_full: pd.Series, name, freq="D", color=None, unit="", fmt=".2f", yaxis="y",
+          dash=None, width=1.6, label_fn=None):
+    """Add a line whose hover shows value + that point's own trailing z-score. Z is computed on
+    the FULL history before clipping to the date slider, so the first visible point still has
+    a full window behind it."""
+    s_full = s_full.dropna()
+    if s_full.empty:
+        return
+    z = _zroll(s_full, Z_HOVER_WINDOW[freq])
+    s = clip(s_full)
+    zc = z.reindex(s.index)
+    xlab = label_fn(s.index) if label_fn else list(s.index.strftime("%Y-%m-%d"))
+    fig.add_trace(go.Scatter(
+        x=s.index, y=s.values, name=name, mode="lines", yaxis=yaxis,
+        line=dict(color=color, width=width, dash=dash),
+        customdata=np.column_stack([zc.values.astype(float), np.array(xlab, dtype=object)]),
+        hovertemplate=f"%{{customdata[1]}}<br>{name}: %{{y:{fmt}}}{unit}<br>"
+                      f"Z ({Z_HOVER_LABEL[freq]}): %{{customdata[0]:.2f}}<extra></extra>"))
+
+def build_card(name, s, fmt, delta_kind, freq):
+    """Returns the dict render_cards() needs. delta_kind: 'bps' (yield in %, delta in bps),
+    'raw_bps' (series already in bps), 'pct' (% change of a level), 'pp' (pp change)."""
+    s = s.dropna() if s is not None else pd.Series(dtype=float)
+    if len(s) < 3:
+        return {"name": name, "val": None}
+    last = float(s.iloc[-1])
+    prev = _value_months_ago(s) if freq in ("D", "W") else float(s.iloc[-2])
+    d, dstr = None, ""
+    if prev is not None:
+        if delta_kind == "bps":
+            d, dstr = (last - prev) * 100, f"{(last - prev) * 100:+.0f}bps"
+        elif delta_kind == "raw_bps":
+            d, dstr = last - prev, f"{last - prev:+.0f}bps"
+        elif delta_kind == "pct":
+            d, dstr = (last / prev - 1) * 100, f"{(last / prev - 1) * 100:+.2f}%"
+        else:
+            d, dstr = last - prev, f"{last - prev:+.2f}pp"
+    dlabel = {"D": "1M", "W": "1M", "M": "MoM", "Q": "QoQ"}[freq]
+    ts = s.index[-1]
+    asof = (ts.strftime("%d %b %Y") if freq in ("D", "W") else
+            f"{ts.year} Q{(ts.month - 1) // 3 + 1}" if freq == "Q" else ts.strftime("%b %Y"))
+    return {"name": name, "val": fmt(last), "delta": f"{dstr} {dlabel}" if d is not None else "",
+            "dcls": "positive" if (d or 0) > 0 else "negative" if (d or 0) < 0 else "neutral",
+            "z": _zscores(s, Z_WINDOWS[freq]), "asof": f"as of {asof}"}
+
+def render_cards(cards, row_size=6):
+    for row_start in range(0, len(cards), row_size):
+        cols = st.columns(row_size)
+        for col, c in zip(cols, cards[row_start:row_start + row_size]):
+            with col:
+                if c.get("val") is None:
+                    st.markdown(f'<div class="metric-card"><div class="metric-label">{c["name"]}</div>'
+                                f'<div class="metric-value neutral">N/A</div></div>', unsafe_allow_html=True)
+                    continue
+                z_spans = []
+                for zl, zv in (c["z"] or {}).items():
+                    if zv is None:
+                        z_spans.append(f'<span class="neutral">{zl} n/a</span>')
+                    else:
+                        zcls = "positive" if zv > 0 else "negative" if zv < 0 else "neutral"
+                        z_spans.append(f'<span class="{zcls}">{zl} {zv:+.1f}</span>')
+                st.markdown(f"""
+                <div class="metric-card">
+                  <div class="metric-label">{c["name"]}</div>
+                  <div class="metric-value neutral">{c["val"]}</div>
+                  <div class="metric-delta {c["dcls"]}">{c["delta"]}</div>
+                  <div class="metric-z">{"".join(z_spans)}</div>
+                  <div class="metric-asof">{c["asof"]}</div>
+                </div>""", unsafe_allow_html=True)
+        st.markdown("<div style='margin-top:8px'></div>", unsafe_allow_html=True)
+
+def _zcolor(v):
+    """Cell style for z-score columns in the monitor tables (green +, red -, darker = further out)."""
+    if pd.isna(v):
+        return "color: #5f6b7e"
+    a = min(abs(v) / 2.5, 1.0)
+    rgb = "38,166,154" if v > 0 else "239,83,80"
+    return f"background-color: rgba({rgb},{0.10 + 0.5 * a:.2f}); color: #e0e0e0"
+
+def _chgcolor(v):
+    if pd.isna(v) or v == 0:
+        return "color: #8a94a6"
+    return "color: #26a69a" if v > 0 else "color: #ef5350"
+
+def _pctcolor(v):
+    if pd.isna(v):
+        return "color: #5f6b7e"
+    return _zcolor((v - 50) / 20)
 
 def mom_yoy(df: pd.DataFrame, col: str, periods_per_year: int) -> pd.DataFrame:
     """periods_per_year=12 for monthly index series, 4 for quarterly."""
@@ -529,6 +680,321 @@ def get_mps_dates():
     except Exception:
         return MPS_FALLBACK
 
+@st.cache_data(ttl=21600)
+def fetch_singstat_multi(resource_id: str, series_nos: tuple, n_periods=200) -> pd.DataFrame:
+    """Several rows of one SingStat table in a single call (same trick as the CPI components
+    fetch). Note `limit` counts cells across all rows, not periods per row."""
+    try:
+        r = requests.get(f"{SINGSTAT_BASE}/{resource_id}", headers=HEADERS, timeout=60,
+                         params={"seriesNoORrowNo": ",".join(series_nos), "limit": n_periods * len(series_nos),
+                                 "sortBy": "key desc"})
+        r.raise_for_status()
+        cols = {}
+        for row in r.json()["Data"]["row"]:
+            s = pd.Series({_parse_singstat_period(c["key"]): _to_float(c["value"]) for c in row["columns"]}).sort_index()
+            cols[row["seriesNo"]] = s[s.index.notna()]
+        return pd.DataFrame(cols)
+    except Exception:
+        return pd.DataFrame()
+
+# ── Long-history SGS benchmark yields (MAS legacy WebForms page) ─────────────────
+# The bondsandbills JSON API above only keeps ~2 years per benchmark tenor (verified live
+# 2026-09-30: 502 records per tenor, starting 2024-10-01) - too short for 1Y z-scores on
+# spreads, 5Y percentiles or proper rolldown history. The legacy "SGS Prices and Yields -
+# Benchmark Issues" page has daily history back to the 1990s via the same GET-then-POST
+# WebForms pattern as SORA. It returns one table per calendar year and silently caps a
+# single request at ~8 years (a 2016-2026 request came back starting 2019), so it's pulled
+# in 6-year chunks concurrently.
+MAS_BENCH_URL = "https://eservices.mas.gov.sg/statistics/fdanet/BenchmarkPricesAndYields.aspx"
+SGS_BENCH_FIELDS = {
+    "3M": "ThreeMonthTreasuryBillYield", "6M": "SixMonthTreasuryBillYield", "1Y": "OneYearTreasuryBillYield",
+    "2Y": "TwoYearBondYield", "5Y": "FiveYearBondYield", "7Y": "SevenYearBondYield",
+    "10Y": "TenYearBondYield", "15Y": "FifteenYearBondYield", "20Y": "TwentyYearBondYield",
+    "30Y": "ThirtyYearBondYield", "50Y": "FiftyYearBondYield",
+}
+SGS_TENOR_YEARS = {"3M": 0.25, "6M": 0.5, "1Y": 1, "2Y": 2, "5Y": 5, "7Y": 7, "10Y": 10,
+                   "15Y": 15, "20Y": 20, "30Y": 30, "50Y": 50}
+
+def _webforms_session(url):
+    s = requests.Session()
+    soup = BeautifulSoup(s.get(url, headers=HEADERS, timeout=20).text, "html.parser")
+    gv = lambda n: (soup.find(attrs={"name": n}) or {}).get("value", "")
+    base = {"__EVENTTARGET": "", "__EVENTARGUMENT": "", "__LASTFOCUS": "",
+            "__VIEWSTATE": gv("__VIEWSTATE"), "__VIEWSTATEGENERATOR": gv("__VIEWSTATEGENERATOR"),
+            "__EVENTVALIDATION": gv("__EVENTVALIDATION")}
+    return s, base
+
+def _parse_mas_year_tables(html):
+    """MAS daily tables: first three columns are year / month / day with year+month only on
+    the first row of each block. Returns a date-indexed frame of the remaining columns
+    (publication-date columns dropped), with '-' / '--' coerced to NaN."""
+    frames = []
+    for tb in BeautifulSoup(html, "html.parser").find_all("table"):
+        try:
+            raw = pd.read_html(io.StringIO(str(tb)))[0]
+        except ValueError:
+            continue
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = [" ".join(dict.fromkeys(str(p) for p in c)) for c in raw.columns]
+        if raw.shape[1] < 4:
+            continue
+        yr = pd.to_numeric(raw.iloc[:, 0], errors="coerce").ffill()
+        mo = raw.iloc[:, 1].ffill().astype(str)
+        dy = pd.to_numeric(raw.iloc[:, 2], errors="coerce")
+        ok = yr.notna() & dy.notna()
+        dates = pd.to_datetime(yr[ok].astype(int).astype(str) + " " + mo[ok] + " " + dy[ok].astype(int).astype(str),
+                               format="%Y %b %d", errors="coerce")
+        vals = raw.loc[ok, [c for c in raw.columns[3:] if "PUBLICATION" not in str(c).upper()]]
+        vals = vals.apply(pd.to_numeric, errors="coerce")
+        vals.index = dates
+        frames.append(vals[vals.index.notna()])
+    return pd.concat(frames).sort_index() if frames else pd.DataFrame()
+
+def _sgs_bench_chunk(y0, y1, m1):
+    s, data = _webforms_session(MAS_BENCH_URL)
+    P = "ctl00$ContentPlaceHolder1$"
+    data.update({P + "StartYearDropDownList": str(y0), P + "StartMonthDropDownList": "1",
+                 P + "EndYearDropDownList": str(y1), P + "EndMonthDropDownList": str(m1),
+                 P + "FrequencyDropDownList": "D", P + "DisplayButton": "Display"})
+    for f in SGS_BENCH_FIELDS.values():
+        data[P + f + "CheckBox"] = "on"
+    df = _parse_mas_year_tables(s.post(MAS_BENCH_URL, headers=HEADERS, data=data, timeout=90).text)
+    # map columns by their "N-Month"/"N-Year" label rather than position
+    rename = {}
+    for c in df.columns:
+        m = re.search(r"(\d+)-(Month|Year)", str(c))
+        if m:
+            rename[c] = f"{m.group(1)}{'M' if m.group(2) == 'Month' else 'Y'}"
+    return df.rename(columns=rename)
+
+@st.cache_data(ttl=21600)
+def fetch_sgs_curve(start_year=2008) -> pd.DataFrame:
+    """Daily SGS benchmark curve, 3M..50Y, columns ordered by tenor. Empty frame on failure."""
+    today = datetime.date.today()
+    chunks = []
+    y = start_year
+    while y <= today.year:
+        y1 = min(y + 5, today.year)
+        chunks.append((y, y1, today.month if y1 == today.year else 12))
+        y = y1 + 1
+    try:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            parts = list(pool.map(lambda a: _sgs_bench_chunk(*a), chunks))
+        df = pd.concat([p for p in parts if not p.empty]).sort_index()
+        df = df[~df.index.duplicated(keep="last")]
+    except Exception:
+        return pd.DataFrame()
+    # Note: MAS stopped quoting 3M and 7Y benchmarks (blank on this page AND null in the
+    # bondsandbills JSON API, checked 2026-09-30), so the live front end is 6M/1Y bills.
+    return df.sort_index()[[t for t in SGS_TENOR_YEARS if t in df.columns]].dropna(how="all")
+
+# ── SORA suite (same DomesticInterestRates.aspx page as fetch_sora) ──────────────
+# Checkbox indices verified live 2026-09-30. Compounded SORA comes back in a different
+# table layout when mixed with other columns, so it's requested on its own.
+SORA_PANEL_COLS = {13: "SORA", 18: "SORA Volume", 19: "SORA High", 20: "SORA Low"}
+SORA_COMP_COLS = {15: "1M Comp. SORA", 16: "3M Comp. SORA", 17: "6M Comp. SORA"}
+
+def _sora_chunk(cols, y0, y1, m1):
+    s, data = _webforms_session(SORA_URL)
+    P = "ctl00$ContentPlaceHolder1$"
+    data.pop("__LASTFOCUS")
+    data.update({P + "StartYearDropDownList": str(y0), P + "EndYearDropDownList": str(y1),
+                 P + "StartMonthDropDownList": "1", P + "EndMonthDropDownList": str(m1),
+                 P + "Button1": "Display"})
+    for i in cols:
+        data[f"{P}ColumnsCheckBoxList${i}"] = "on"
+    df = _parse_mas_year_tables(s.post(SORA_URL, headers=HEADERS, data=data, timeout=60).text)
+    if df.shape[1] != len(cols):
+        raise ValueError(f"unexpected SORA table layout: {list(df.columns)}")
+    df.columns = [cols[i] for i in sorted(cols)]
+    return df
+
+@st.cache_data(ttl=21600)
+def fetch_sora_suite(start_year=2016) -> pd.DataFrame:
+    today = datetime.date.today()
+    jobs = []
+    for cols in (SORA_PANEL_COLS, SORA_COMP_COLS):
+        y = start_year
+        while y <= today.year:
+            y1 = min(y + 5, today.year)
+            jobs.append((cols, y, y1, today.month if y1 == today.year else 12))
+            y = y1 + 1
+    try:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            parts = list(pool.map(lambda a: _sora_chunk(*a), jobs))
+        panel = pd.concat([p for p, j in zip(parts, jobs) if j[0] is SORA_PANEL_COLS]).sort_index()
+        comp = pd.concat([p for p, j in zip(parts, jobs) if j[0] is SORA_COMP_COLS]).sort_index()
+        out = pd.concat([panel[~panel.index.duplicated()], comp[~comp.index.duplicated()]], axis=1)
+        return out.dropna(how="all")
+    except Exception:
+        return pd.DataFrame()
+
+# ── US comparables (keyless, so this app still deploys without a FRED key) ───────
+UST_COLS = {"1 Mo": "1M", "3 Mo": "3M", "6 Mo": "6M", "1 Yr": "1Y", "2 Yr": "2Y", "5 Yr": "5Y",
+            "7 Yr": "7Y", "10 Yr": "10Y", "20 Yr": "20Y", "30 Yr": "30Y"}
+
+def _ust_year(y):
+    u = (f"https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-rates.csv/"
+         f"{y}/all?type=daily_treasury_yield_curve&field_tdr_date_value={y}&page&_format=csv")
+    df = pd.read_csv(io.StringIO(requests.get(u, headers=HEADERS, timeout=30).text))
+    df["Date"] = pd.to_datetime(df["Date"], format="%m/%d/%Y")
+    return df.set_index("Date")[[c for c in UST_COLS if c in df.columns]].rename(columns=UST_COLS)
+
+@st.cache_data(ttl=21600)
+def fetch_ust_curve(start_year=2008) -> pd.DataFrame:
+    """US Treasury par curve from treasury.gov's per-year CSV (the all-years CSV is 403'd)."""
+    try:
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            parts = list(pool.map(_ust_year, range(start_year, datetime.date.today().year + 1)))
+        return pd.concat(parts).sort_index()
+    except Exception:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=21600)
+def fetch_sofr() -> pd.Series:
+    try:
+        j = requests.get("https://markets.newyorkfed.org/api/rates/secured/sofr/search.json",
+                         params={"startDate": "2018-04-02", "endDate": datetime.date.today().isoformat()},
+                         timeout=40).json()
+        return pd.Series({pd.Timestamp(r["effectiveDate"]): float(r["percentRate"]) for r in j["refRates"]},
+                         name="SOFR").sort_index()
+    except Exception:
+        return pd.Series(dtype=float, name="SOFR")
+
+# ── FX panel (yfinance) ─────────────────────────────────────────────────────────
+# (ticker, True if quoted USD-per-FCY like EURUSD, False if FCY-per-USD like USDJPY)
+# CNY (onshore) rather than CNH: Yahoo's CNH=X only returns a handful of recent rows.
+FX_TICKERS = {
+    "USD": ("SGD=X", None), "CNY": ("CNY=X", False), "MYR": ("MYR=X", False), "EUR": ("EURUSD=X", True),
+    "JPY": ("JPY=X", False), "TWD": ("TWD=X", False), "KRW": ("KRW=X", False), "IDR": ("IDR=X", False),
+    "HKD": ("HKD=X", False), "THB": ("THB=X", False), "INR": ("INR=X", False), "AUD": ("AUDUSD=X", True),
+    "GBP": ("GBPUSD=X", True), "PHP": ("PHP=X", False), "VND": ("VND=X", False),
+}
+# Conventional market quote for each cross vs SGD (display only - analytics use FCY per SGD)
+FX_DISPLAY = {"USD": "USD/SGD", "EUR": "EUR/SGD", "GBP": "GBP/SGD", "AUD": "AUD/SGD", "CNY": "SGD/CNY",
+              "MYR": "SGD/MYR", "JPY": "SGD/JPY", "KRW": "SGD/KRW", "TWD": "SGD/TWD", "IDR": "SGD/IDR",
+              "THB": "SGD/THB", "INR": "SGD/INR", "HKD": "SGD/HKD", "PHP": "SGD/PHP", "VND": "SGD/VND"}
+
+@st.cache_data(ttl=3600)
+def fetch_fx_panel(start="2008-01-01") -> pd.DataFrame:
+    tickers = [t for t, _ in FX_TICKERS.values()] + ["DX-Y.NYB"]
+    try:
+        px = _yf_retry(lambda: yf.download(tickers, start=start, progress=False, auto_adjust=True)["Close"])
+    except Exception:
+        px = pd.DataFrame(columns=tickers)
+    # yf.download doesn't raise when only SOME tickers fail (it just leaves NaN columns) - retry
+    # those individually so one Yahoo hiccup doesn't silently drop a currency from the basket.
+    for t in tickers:
+        if t not in px.columns or px[t].dropna().empty:
+            try:
+                one = _yf_retry(lambda: yf.download(t, start=start, progress=False, auto_adjust=True)["Close"])
+                one = one.iloc[:, 0] if isinstance(one, pd.DataFrame) else one
+                px = px.reindex(px.index.union(one.index))
+                px[t] = one
+            except Exception:
+                pass
+    if px.empty:
+        return px
+    px.index = pd.to_datetime(px.index).tz_localize(None)
+    return px.sort_index()
+
+def fcy_per_sgd(px: pd.DataFrame) -> pd.DataFrame:
+    """Units of each foreign currency per 1 SGD (up = SGD stronger), from USD crosses."""
+    usdsgd = px["SGD=X"]
+    out = {}
+    for ccy, (tkr, usd_quote) in FX_TICKERS.items():
+        if tkr not in px.columns:
+            continue
+        if ccy == "USD":
+            out[ccy] = 1 / usdsgd
+        elif usd_quote:
+            out[ccy] = 1 / (px[tkr] * usdsgd)
+        else:
+            out[ccy] = px[tkr] / usdsgd
+    return pd.DataFrame(out).ffill(limit=3)
+
+def display_quote(fcy: pd.DataFrame, ccy: str) -> pd.Series:
+    return 1 / fcy[ccy] if FX_DISPLAY[ccy].endswith("/SGD") else fcy[ccy]
+
+# ── Daily S$NEER model ──────────────────────────────────────────────────────────
+# MAS only publishes S$NEER weekly and with a lag (latest print was ~1 month old when this was
+# built), and doesn't publish its trade weights. Standard sell-side workaround: recover the
+# basket by regressing weekly log-changes of the official index on weekly log-changes of SGD
+# crosses (non-negative least squares, weights normalised to sum to 1), then chain daily
+# crosses with those weights and anchor the level to MAS's own latest print. Verified
+# 2026-09-30 on a 3Y window: R-squared ~0.82 on weekly changes - good enough to fill the gap
+# since MAS's last print, not a substitute for it.
+@st.cache_data(ttl=3600)
+def build_neer_model(fcy: pd.DataFrame, neer: pd.Series, calib_weeks=156):
+    recent = fcy[fcy.index >= fcy.index[-1] - pd.DateOffset(weeks=calib_weeks + 8)]
+    fcy = fcy[[c for c in fcy.columns if recent[c].notna().mean() > 0.9]]   # drop patchy tickers
+    logd = np.log(fcy.ffill().dropna(how="any"))
+    wk = logd.resample("W-FRI").mean().diff().dropna()      # MAS = "average for week ending" Friday
+    y = np.log(neer).diff().dropna()
+    idx = wk.index.intersection(y.index)[-calib_weeks:]
+    X, Y = wk.loc[idx].values, y.loc[idx].values
+    # HKD is pegged to USD, so those two columns are near-collinear - give NNLS room to converge
+    w, _ = nnls(X, Y, maxiter=50 * X.shape[1])
+    r2 = 1 - ((Y - X @ w) ** 2).sum() / ((Y - Y.mean()) ** 2).sum()
+    w = w / w.sum()
+    model = np.exp(logd.values @ w)
+    model = pd.Series(model, index=logd.index, name="Model S$NEER")
+    last_wk = neer.index[-1]
+    k = neer.iloc[-1] / model[(model.index > last_wk - pd.Timedelta(days=7)) & (model.index <= last_wk)].mean()
+    model = model * k
+    weights = pd.Series(w, index=fcy.columns).sort_values(ascending=False)
+    return model, weights, float(r2), idx[0], idx[-1]
+
+def estimate_band(level: pd.Series, anchor, half_width, slope_pa=None):
+    """Estimated policy band: log-linear trend through the index since `anchor` (or a fixed
+    user-supplied slope, intercept fitted), +/- half_width %. MAS doesn't publish the band's
+    level, slope or width - this is the usual street-style estimate, not an official number."""
+    s = level[level.index >= pd.Timestamp(anchor)].dropna()
+    if len(s) < 10:
+        return pd.DataFrame(), np.nan
+    t = (s.index - s.index[0]).days.values / 365.25
+    if slope_pa is None:
+        b, a = np.polyfit(t, np.log(s.values), 1)
+    else:
+        b = np.log(1 + slope_pa / 100)
+        a = float(np.mean(np.log(s.values) - b * t))
+    mid = np.exp(a + b * t)
+    band = pd.DataFrame({"Level": s.values, "Mid": mid, "Upper": mid * (1 + half_width / 100),
+                         "Lower": mid * (1 - half_width / 100)}, index=s.index)
+    band["Dev from Mid %"] = (band["Level"] / band["Mid"] - 1) * 100
+    return band, (np.exp(b) - 1) * 100
+
+# ── Curve analytics ─────────────────────────────────────────────────────────────
+def curve_interp(row: pd.Series, targets):
+    pairs = sorted((SGS_TENOR_YEARS[k], v) for k, v in row.items() if k in SGS_TENOR_YEARS and pd.notna(v))
+    if len(pairs) < 2:
+        return np.full(len(targets), np.nan)
+    xs, ys = zip(*pairs)
+    return np.interp(targets, xs, ys)
+
+def rolldown_series(yc: pd.DataFrame, tenors, horizon=1.0) -> pd.DataFrame:
+    """Rolldown(T) = y(T) - y(T - horizon) on each date's own curve, in bps (positive = the bond
+    gains yield-pickup as it rolls down a positively sloped curve). Same idea as usa_macro's
+    compute_rolldown_series."""
+    yrs = [SGS_TENOR_YEARS[t] for t in tenors]
+    vals = [curve_interp(row, yrs) - curve_interp(row, [y - horizon for y in yrs]) for _, row in yc.iterrows()]
+    return pd.DataFrame(np.array(vals) * 100, index=yc.index, columns=tenors)
+
+def auction_concessions(auctions: pd.DataFrame, yc: pd.DataFrame) -> pd.DataFrame:
+    """For each SGS bond / T-bill auction: tail = cutoff - median yield, and concession = cutoff
+    yield vs the previous business day's benchmark curve interpolated at the issue's remaining
+    maturity (positive = auction cleared cheap to the secondary curve)."""
+    df = auctions[auctions["product_type"].isin(["N", "B"]) & auctions["cutoff_yield"].notna()].copy()
+    df = df[df["auction_date"] >= yc.index[0] + pd.Timedelta(days=5)]
+    df["years"] = (df["maturity_date"] - df["issue_date"]).dt.days / 365.25
+    df["Tail (bps)"] = (df["cutoff_yield"] - pd.to_numeric(df["median_yield"], errors="coerce")) * 100
+    conc = []
+    for _, r in df.iterrows():
+        prev = yc[yc.index < r["auction_date"]]
+        conc.append((r["cutoff_yield"] - curve_interp(prev.iloc[-1], [r["years"]])[0]) * 100 if len(prev) else np.nan)
+    df["Concession (bps)"] = conc
+    return df
+
 # ── Dividend seasonality (SGX blue chips + major S-REITs, via yfinance) ─────────
 # yfinance covers SGX tickers directly (".SI" suffix) - confirmed live for this basket.
 # Not from SingStat/MAS; this is equities/corporate-actions data, a different domain from
@@ -644,8 +1110,9 @@ def get_sg_dividend_payouts(years_back=11) -> tuple[pd.DataFrame, list[str]]:
 
 # ── Date range ────────────────────────────────────────────────────────────────
 st.title("🇸🇬 SG Macro Dashboard")
-st.caption("Data: SingStat Table Builder · MAS Bonds & Bills / Domestic Interest Rates · No NBER-style "
-           "recession series exists for Singapore, so no recession shading here (unlike the US dashboard).")
+st.caption("Data: SingStat · MAS (S\\$NEER, SORA suite, SGS benchmarks, bonds & bills) · US Treasury · NY Fed · "
+           "yfinance. Dotted verticals on rates/FX charts mark MAS Monetary Policy Statements (no NBER-style "
+           "recession series exists for Singapore, so there's no recession shading).")
 
 col_d1, col_d2 = st.columns([3, 1])
 with col_d1:
@@ -669,119 +1136,818 @@ def qlabels(index):
     gives hover text an unambiguous "20XX QN" label instead."""
     return [f"{ts.year} Q{(ts.month - 1) // 3 + 1}" for ts in index]
 
+# ── Market data shared by the summary bar and the SGD / Rates / Funding tabs ─────
+with st.spinner("Loading SGS curve, SORA, UST, FX & S\\$NEER…"):
+    sgs = fetch_sgs_curve()
+    sora_all = fetch_sora_suite()
+    ust = fetch_ust_curve()
+    sofr = fetch_sofr()
+    fx_px = fetch_fx_panel()
+    neer = fetch_sneer()
+    mps_dates = [pd.Timestamp(d) for d in get_mps_dates()]
+
+EMPTY = pd.Series(dtype=float)
+def _col(df, c):
+    return df[c].dropna() if (not df.empty and c in df.columns) else EMPTY
+
+for _name, _df in [("SGS benchmark yields (MAS)", sgs), ("SORA / compounded SORA (MAS)", sora_all),
+                   ("US Treasury curve (treasury.gov)", ust), ("FX (yfinance)", fx_px)]:
+    if _df.empty:
+        st.warning(f"Could not load {_name} - dependent charts and cards will show N/A until the next refresh.")
+
+fcy = fcy_per_sgd(fx_px) if (not fx_px.empty and "SGD=X" in fx_px.columns) else pd.DataFrame()
+usdsgd = _col(fx_px, "SGD=X")
+neer_w = _col(neer, "S$NEER")
+neer_model, neer_weights, neer_r2, neer_cal0, neer_cal1 = None, None, np.nan, None, None
+if not fcy.empty and len(neer_w) > 200:
+    try:
+        neer_model, neer_weights, neer_r2, neer_cal0, neer_cal1 = build_neer_model(fcy, neer_w)
+    except Exception as e:
+        st.warning(f"S\\$NEER daily model could not be fitted: {e}")
+neer_daily = neer_model if neer_model is not None else neer_w
+
+# Policy-band assumptions live in session_state so the summary bar (rendered first) and the
+# widgets in the SGD tab (rendered later) always agree - a widget change just reruns the script.
+st.session_state.setdefault("band_anchor", (pd.Timestamp.today() - pd.DateOffset(years=1)).date())
+st.session_state.setdefault("band_hw", 2.0)
+st.session_state.setdefault("band_slope_mode", "Fit from data")
+st.session_state.setdefault("band_slope", 1.0)
+band_df, band_slope = estimate_band(
+    neer_daily, st.session_state.band_anchor, st.session_state.band_hw,
+    None if st.session_state.band_slope_mode == "Fit from data" else st.session_state.band_slope)
+
+y2, y5, y10, y20, y30, y50 = (_col(sgs, t) for t in ("2Y", "5Y", "10Y", "20Y", "30Y", "50Y"))
+bill6, bill12 = _col(sgs, "6M"), _col(sgs, "1Y")
+sora = _col(sora_all, "SORA")
+csora1, csora3, csora6 = (_col(sora_all, f"{m}M Comp. SORA") for m in (1, 3, 6))
+
+def _spread(a, b, mult=100):
+    return ((a - b) * mult).dropna()
+
+SPREADS = {
+    "2s5s": _spread(y5, y2), "2s10s": _spread(y10, y2), "5s30s": _spread(y30, y5),
+    "10s30s": _spread(y30, y10), "30s50s": _spread(y50, y30),
+    "2s5s10s Fly": ((2 * y5 - y2 - y10) * 100).dropna(),
+}
+sgs_ust_2 = _spread(y2, _col(ust, "2Y"))
+sgs_ust_10 = _spread(y10, _col(ust, "10Y"))
+sora_sofr = _spread(sora, sofr)
+
 # ── Summary bar ───────────────────────────────────────────────────────────────
-st.markdown('<div class="section-header">Latest Readings</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-header">Latest Readings & Z-Scores</div>', unsafe_allow_html=True)
 
 @st.cache_data(ttl=3600)
-def get_summary_metrics():
-    metrics = {}
-    try:
-        cpi = fetch_singstat("M213751", "CPI")["CPI"].dropna()
-        val = cpi.pct_change(12).iloc[-1] * 100
-        prev = cpi.pct_change(12).iloc[-2] * 100
-        metrics["CPI YoY"] = (val, val - prev, "%")
-    except Exception:
-        metrics["CPI YoY"] = (None, None, "")
-    try:
-        core = fetch_singstat("M213891", "Core")["Core"].dropna()
-        val = core.pct_change(12).iloc[-1] * 100
-        prev = core.pct_change(12).iloc[-2] * 100
-        metrics["Core Infl. YoY"] = (val, val - prev, "%")
-    except Exception:
-        metrics["Core Infl. YoY"] = (None, None, "")
-    try:
-        # series_no="2" is "GDP In Chained (2015) Dollars" - real GDP, the standard headline
-        # figure (e.g. MTI's own release). series_no="1" (the default) is nominal GDP "At
-        # Current Market Prices" and reads roughly 2x too high - confirmed live: series "1"
-        # gave 12.4% for 2Q 2026 vs series "2"'s 5.9%, which matches MTI's reported figure
-        # exactly.
-        gdp = fetch_singstat("M015631", "GDP YoY", series_no="2")["GDP YoY"].dropna()
-        metrics["GDP YoY"] = (float(gdp.iloc[-1]), float(gdp.iloc[-1] - gdp.iloc[-2]), "%")
-    except Exception:
-        metrics["GDP YoY"] = (None, None, "")
-    try:
-        u = fetch_singstat("M182342", "Unemployment")["Unemployment"].dropna()
-        metrics["Unemp Rate"] = (float(u.iloc[-1]), float(u.iloc[-1] - u.iloc[-2]), "%")
-    except Exception:
-        metrics["Unemp Rate"] = (None, None, "")
-    try:
-        sora = fetch_sora(years_back=1)["SORA"].dropna()
-        metrics["SORA"] = (float(sora.iloc[-1]), float(sora.iloc[-1] - sora.iloc[-2]), "%")
-    except Exception:
-        metrics["SORA"] = (None, None, "")
-    try:
-        y10 = fetch_sgs_yield("10", "10Y")["10Y"].dropna()
-        metrics["10Y SGS"] = (float(y10.iloc[-1]), float(y10.iloc[-1] - y10.iloc[-2]), "%")
-    except Exception:
-        metrics["10Y SGS"] = (None, None, "")
-    try:
-        y2 = fetch_sgs_yield("2", "2Y")["2Y"].dropna()
-        y5 = fetch_sgs_yield("5", "5Y")["5Y"].dropna()
-        y10b = fetch_sgs_yield("10", "10Y")["10Y"].dropna()
-        curve = pd.concat([y2, y5, y10b], axis=1, keys=["2Y", "5Y", "10Y"]).ffill().dropna()
-        s2s10s = (curve["10Y"] - curve["2Y"]) * 100  # bps
-        metrics["2s10s"] = (float(s2s10s.iloc[-1]), float(s2s10s.iloc[-1] - s2s10s.iloc[-2]), "bps")
-        s2s5s10s = (2 * curve["5Y"] - curve["10Y"] - curve["2Y"]) * 100  # bps, butterfly
-        metrics["2s5s10s"] = (float(s2s5s10s.iloc[-1]), float(s2s5s10s.iloc[-1] - s2s5s10s.iloc[-2]), "bps")
-    except Exception:
-        metrics["2s10s"] = (None, None, "")
-        metrics["2s5s10s"] = (None, None, "")
-    try:
-        nodx = fetch_singstat("M451301", "NODX")["NODX"].dropna()
-        val = nodx.pct_change(12).iloc[-1] * 100
-        prev = nodx.pct_change(12).iloc[-2] * 100
-        metrics["NODX YoY"] = (val, val - prev, "%")
-    except Exception:
-        metrics["NODX YoY"] = (None, None, "")
-    try:
-        rs = fetch_singstat("M602122", "Retail")["Retail"].dropna()
-        val = rs.pct_change(12).iloc[-1] * 100
-        prev = rs.pct_change(12).iloc[-2] * 100
-        metrics["Retail Sales YoY"] = (val, val - prev, "%")
-    except Exception:
-        metrics["Retail Sales YoY"] = (None, None, "")
-    return metrics
+def get_macro_series():
+    out = {}
+    cpi_s = fetch_singstat("M213751", "CPI")
+    core_s = fetch_singstat("M213891", "Core")
+    nodx_s = fetch_singstat("M451301", "NODX")
+    rs_s = fetch_singstat("M602122", "Retail")
+    out["CPI YoY"] = (cpi_s["CPI"].pct_change(12) * 100) if not cpi_s.empty else EMPTY
+    out["Core Infl. YoY"] = (core_s["Core"].pct_change(12) * 100) if not core_s.empty else EMPTY
+    out["NODX YoY"] = (nodx_s["NODX"].pct_change(12) * 100) if not nodx_s.empty else EMPTY
+    out["Retail Sales YoY"] = (rs_s["Retail"].pct_change(12) * 100) if not rs_s.empty else EMPTY
+    # series_no="2" = real GDP (chained 2015 $) - series "1" is nominal and reads ~2x too high
+    g = fetch_singstat("M015631", "GDP YoY", series_no="2")
+    out["GDP YoY"] = g["GDP YoY"] if not g.empty else EMPTY
+    u_s = fetch_singstat("M182342", "Unemployment")
+    out["Unemp Rate"] = u_s["Unemployment"] if not u_s.empty else EMPTY
+    return out
 
 with st.spinner("Loading summary metrics…"):
-    summary = get_summary_metrics()
+    macro = get_macro_series()
 
-items = list(summary.items())
-ROW_SIZE = 5
-for row_start in range(0, len(items), ROW_SIZE):
-    row_items = items[row_start:row_start + ROW_SIZE]
-    cols = st.columns(ROW_SIZE)
-    for col, (name, (val, delta, unit)) in zip(cols, row_items):
-        with col:
-            if val is None:
-                st.markdown(f'<div class="metric-card"><div class="metric-label">{name}</div><div class="metric-value neutral">N/A</div></div>', unsafe_allow_html=True)
-                continue
-            val_str = f"{round(val, 3):.3f}{unit}"
-            delta_str = f"{round(delta, 3):+.3f}{unit}" if delta is not None else ""
-            delta_cls = "positive" if (delta or 0) > 0 else "negative" if (delta or 0) < 0 else "neutral"
-            st.markdown(f"""
-            <div class="metric-card">
-              <div class="metric-label">{name}</div>
-              <div class="metric-value neutral">{val_str}</div>
-              <div class="metric-delta {delta_cls}">{delta_str}</div>
-            </div>""", unsafe_allow_html=True)
-    st.markdown("<div style='margin-top:8px'></div>", unsafe_allow_html=True)
-
+pct2 = lambda v: f"{v:.2f}%"
+bps0 = lambda v: f"{v:+.0f}bps"
+cards = [
+    build_card("USD/SGD", usdsgd, lambda v: f"{v:.4f}", "pct", "D"),
+    build_card("S$NEER (daily model)", neer_daily, lambda v: f"{v:.2f}", "pct", "D"),
+    build_card("S$NEER vs Est. Mid", band_df["Dev from Mid %"] if not band_df.empty else EMPTY,
+               lambda v: f"{v:+.2f}%", "pp", "D"),
+    build_card("SORA", sora, pct2, "bps", "D"),
+    build_card("3M Comp. SORA", csora3, pct2, "bps", "D"),
+    build_card("SORA − SOFR", sora_sofr, bps0, "raw_bps", "D"),
+    build_card("2Y SGS", y2, pct2, "bps", "D"),
+    build_card("10Y SGS", y10, pct2, "bps", "D"),
+    build_card("2s10s", SPREADS["2s10s"], bps0, "raw_bps", "D"),
+    build_card("5s30s", SPREADS["5s30s"], bps0, "raw_bps", "D"),
+    build_card("2s5s10s Fly", SPREADS["2s5s10s Fly"], bps0, "raw_bps", "D"),
+    build_card("10Y SGS − UST", sgs_ust_10, bps0, "raw_bps", "D"),
+    build_card("CPI YoY", macro["CPI YoY"], pct2, "pp", "M"),
+    build_card("Core Infl. YoY", macro["Core Infl. YoY"], pct2, "pp", "M"),
+    build_card("GDP YoY", macro["GDP YoY"], pct2, "pp", "Q"),
+    build_card("Unemp Rate", macro["Unemp Rate"], pct2, "pp", "Q"),
+    build_card("NODX YoY", macro["NODX YoY"], pct2, "pp", "M"),
+    build_card("Retail Sales YoY", macro["Retail Sales YoY"], pct2, "pp", "M"),
+]
+render_cards(cards)
+st.caption("Z-scores: daily series use 1M/3M/1Y trailing windows, monthly 3M/12M/36M, quarterly 4Q/8Q/20Q "
+           "(same convention as the US dashboard). \"S\\$NEER vs Est. Mid\" depends on the band assumptions set "
+           "in the SGD & MAS Policy tab.")
 st.markdown("<br>", unsafe_allow_html=True)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tabs = st.tabs([
+    "SGD & MAS Policy",
+    "SGS & Rates",
+    "Funding & Liquidity",
+    "Supply & Auctions",
     "Prices",
     "Growth & Labour",
-    "Trade & Production",
-    "SGD & Rates",
+    "Trade & Activity",
     "Dividends",
     "Economic Calendar",
 ])
 
+def add_mps_lines(fig):
+    for d in mps_dates:
+        if START <= d <= END:
+            fig.add_vline(x=d, line_dash="dot", line_color="rgba(255,255,255,0.18)", line_width=1)
+
+def realized_vol(level: pd.Series, window: int) -> pd.Series:
+    return np.log(level.dropna()).diff().rolling(window).std() * np.sqrt(252) * 100
+
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 1 — Prices
+# TAB 1 — SGD & MAS Policy
 # ════════════════════════════════════════════════════════════════════════════════
 with tabs[0]:
+    st.header("SGD & MAS Policy")
+    st.caption("MAS targets the S\\$NEER inside an undisclosed band (slope, width and centre are never published), "
+               "reviewed at each MPS - so the band below is a trend-fit estimate you control, not an official figure. "
+               "MAS publishes S\\$NEER weekly with a lag; the daily line is a model (see weights at the bottom).")
+
+    with st.expander("Policy band assumptions", expanded=False):
+        b1, b2, b3, b4 = st.columns(4)
+        b1.date_input("Trend-fit anchor (e.g. last re-centring / slope change)", key="band_anchor")
+        b2.number_input("Band half-width (%)", min_value=0.25, max_value=5.0, step=0.25, key="band_hw")
+        b3.radio("Slope", ["Fit from data", "Manual"], key="band_slope_mode", horizontal=True)
+        b4.number_input("Manual slope (% p.a.)", min_value=-3.0, max_value=5.0, step=0.25, key="band_slope",
+                        disabled=st.session_state.band_slope_mode != "Manual")
+
+    hw = st.session_state.band_hw
+    if not band_df.empty:
+        dev = float(band_df["Dev from Mid %"].iloc[-1])
+        pos = max(-1.0, min(1.0, dev / hw))
+        g1, g2 = st.columns([2, 3])
+        with g1:
+            st.markdown(f"""
+            <div class="band-wrap">
+              <div class="metric-label">Position in estimated band ({band_df.index[-1]:%d %b %Y})</div>
+              <div class="metric-value {'positive' if dev > 0 else 'negative'}">{dev:+.2f}% vs mid
+                &nbsp;·&nbsp; {pos * 100:+.0f}% of half-width</div>
+              <div class="band-track"><div class="band-mid"></div>
+                <div class="band-dot" style="left:{50 + 50 * pos:.1f}%"></div></div>
+              <div class="band-scale"><span>Weak edge −{hw:.2f}%</span><span>Mid</span><span>Strong edge +{hw:.2f}%</span></div>
+            </div>""", unsafe_allow_html=True)
+        with g2:
+            k = st.columns(4)
+            k[0].metric("Est. slope", f"{band_slope:+.2f}% p.a.")
+            k[1].metric("Model S$NEER", f"{band_df['Level'].iloc[-1]:.2f}")
+            k[2].metric("Last MAS print", f"{neer_w.iloc[-1]:.2f}" if not neer_w.empty else "N/A",
+                        f"{neer_w.index[-1]:%d %b}" if not neer_w.empty else None, delta_color="off")
+            k[3].metric("Model fit (R², weekly Δ)", f"{neer_r2:.2f}" if pd.notna(neer_r2) else "N/A")
+
+    # S$NEER + estimated band
+    fig_band = go.Figure()
+    if not band_df.empty:
+        bd = clip(band_df)
+        fig_band.add_trace(go.Scatter(x=bd.index, y=bd["Upper"], line=dict(color="rgba(38,166,154,0.6)", dash="dot", width=1),
+                                      name=f"Est. upper (+{hw:.2f}%)"))
+        fig_band.add_trace(go.Scatter(x=bd.index, y=bd["Lower"], line=dict(color="rgba(239,83,80,0.6)", dash="dot", width=1),
+                                      fill="tonexty", fillcolor="rgba(144,164,212,0.07)", name=f"Est. lower (−{hw:.2f}%)"))
+        fig_band.add_trace(go.Scatter(x=bd.index, y=bd["Mid"], line=dict(color="#e0e0e0", dash="dash", width=1),
+                                      name=f"Est. mid ({band_slope:+.2f}% p.a.)"))
+    if neer_model is not None:
+        fig_band.add_trace(go.Scatter(x=clip(neer_model).index, y=clip(neer_model).values, name="Daily model",
+                                      line=dict(color="#ff9800", width=1.4)))
+    if not neer_w.empty:
+        nw = clip(neer_w)
+        fig_band.add_trace(go.Scatter(x=nw.index, y=nw.values, name="MAS S$NEER (weekly)", mode="markers",
+                                      marker=dict(color="#4fc3f7", size=4)))
+    add_mps_lines(fig_band)
+    fig_band.update_layout(**base_layout("S$NEER vs Estimated Policy Band (dotted verticals = MPS dates)", height=520))
+    st.plotly_chart(fig_band, use_container_width=True, key="chart_neer_band")
+    csv_download(band_df, "sneer_band_estimate")
+
+    fig_dev = go.Figure()
+    if not band_df.empty:
+        zline(fig_dev, band_df["Dev from Mid %"], "Deviation from est. mid", color="#ff9800", unit="%")
+        for lvl, c in [(hw, "#26a69a"), (-hw, "#ef5350"), (0, "#555")]:
+            fig_dev.add_hline(y=lvl, line_dash="dot", line_color=c)
+    fig_dev.update_layout(**base_layout("S$NEER — Deviation from Estimated Mid (%)"))
+    fig_dev.update_yaxes(ticksuffix="%")
+
+    fig_usdsgd = go.Figure()
+    if not usdsgd.empty:
+        zline(fig_usdsgd, usdsgd, "USD/SGD", color="#90a4d4", fmt=".4f")
+        for w_, c in [(50, "#ff9800"), (200, "#ab47bc")]:
+            ma = clip(usdsgd.rolling(w_).mean())
+            fig_usdsgd.add_trace(go.Scatter(x=ma.index, y=ma.values, name=f"{w_}D MA", line=dict(color=c, width=1, dash="dot")))
+    fig_usdsgd.update_layout(**base_layout("USD/SGD Spot with 50D / 200D Moving Averages"))
+
+    fig_rvol = go.Figure()
+    rvol_df = pd.DataFrame()
+    if not usdsgd.empty:
+        rvol_df = pd.DataFrame({"USD/SGD 1M": realized_vol(usdsgd, 21), "USD/SGD 3M": realized_vol(usdsgd, 63)})
+        if neer_model is not None:
+            rvol_df["S$NEER model 1M"] = realized_vol(neer_model, 21)
+        for c_, col in zip(rvol_df.columns, ["#90a4d4", "#42a5f5", "#ff9800"]):
+            zline(fig_rvol, rvol_df[c_], c_, color=col, unit="%")
+    fig_rvol.update_layout(**base_layout("Realized Volatility (annualised, %)"))
+    fig_rvol.update_yaxes(ticksuffix="%")
+
+    # SGD performance heatmap (positive = SGD stronger vs that currency)
+    fig_perf = go.Figure()
+    perf = pd.DataFrame()
+    if not fcy.empty:
+        rows = {}
+        for ccy in fcy.columns:
+            s_ = fcy[ccy].dropna()
+            if len(s_) < 260:
+                continue
+            last_ = s_.iloc[-1]
+            ytd_base = s_[s_.index < pd.Timestamp(s_.index[-1].year, 1, 1)]
+            rows[FX_DISPLAY[ccy]] = {
+                "1W": (last_ / s_.asof(s_.index[-1] - pd.Timedelta(days=7)) - 1) * 100,
+                "1M": (last_ / s_.asof(s_.index[-1] - pd.DateOffset(months=1)) - 1) * 100,
+                "3M": (last_ / s_.asof(s_.index[-1] - pd.DateOffset(months=3)) - 1) * 100,
+                "YTD": (last_ / ytd_base.iloc[-1] - 1) * 100 if not ytd_base.empty else np.nan,
+                "1Y": (last_ / s_.asof(s_.index[-1] - pd.DateOffset(years=1)) - 1) * 100,
+            }
+        if neer_model is not None:
+            nm = neer_model
+            rows["S$NEER (model)"] = {
+                "1W": (nm.iloc[-1] / nm.asof(nm.index[-1] - pd.Timedelta(days=7)) - 1) * 100,
+                "1M": (nm.iloc[-1] / nm.asof(nm.index[-1] - pd.DateOffset(months=1)) - 1) * 100,
+                "3M": (nm.iloc[-1] / nm.asof(nm.index[-1] - pd.DateOffset(months=3)) - 1) * 100,
+                "YTD": (nm.iloc[-1] / nm[nm.index < pd.Timestamp(nm.index[-1].year, 1, 1)].iloc[-1] - 1) * 100,
+                "1Y": (nm.iloc[-1] / nm.asof(nm.index[-1] - pd.DateOffset(years=1)) - 1) * 100,
+            }
+        perf = pd.DataFrame(rows).T.sort_values("3M")
+        lim = float(np.nanmax(np.abs(perf.values))) if not perf.empty else 1
+        fig_perf.add_trace(go.Heatmap(
+            z=perf.values, x=perf.columns, y=perf.index, zmin=-lim, zmax=lim,
+            colorscale=[[0, "#ef5350"], [0.5, PLOT_BG], [1, "#26a69a"]],
+            text=perf.round(2).values, texttemplate="%{text:+.2f}%", textfont=dict(size=10),
+            hovertemplate="SGD vs %{y}, %{x}: %{z:+.2f}%<extra></extra>", showscale=False))
+    fig_perf.update_layout(**base_layout("SGD Performance vs Crosses (%, + = SGD stronger)", height=520))
+
+    # Rebased crosses
+    default_x = [c for c in ["USD", "CNY", "MYR", "JPY", "EUR"] if c in fcy.columns]
+    pick = st.multiselect("Crosses to rebase (SGD strength, 100 = start of date range)",
+                          [c for c in fcy.columns], default=default_x, key="sgd_rebase_pick",
+                          format_func=lambda c: FX_DISPLAY[c])
+    fig_rebase = go.Figure()
+    for c_ in pick:
+        s_ = clip(fcy[c_].dropna())
+        if not s_.empty:
+            fig_rebase.add_trace(go.Scatter(x=s_.index, y=s_ / s_.iloc[0] * 100, name=f"SGD vs {c_}", mode="lines"))
+    if neer_model is not None:
+        nm_c = clip(neer_model)
+        fig_rebase.add_trace(go.Scatter(x=nm_c.index, y=nm_c / nm_c.iloc[0] * 100, name="S$NEER (model)",
+                                        line=dict(color="white", width=2)))
+    fig_rebase.add_hline(y=100, line_dash="dot", line_color="#555")
+    fig_rebase.update_layout(**base_layout("SGD vs Selected Crosses — Rebased (up = SGD stronger)"))
+
+    # USD-leg analytics: USD/X for Asia + DXY, daily log returns
+    usd_x = pd.DataFrame()
+    if not fx_px.empty:
+        for ccy, (tkr, usd_quote) in FX_TICKERS.items():
+            if tkr in fx_px.columns and ccy in ("USD", "CNY", "MYR", "KRW", "TWD", "JPY", "IDR", "THB", "INR", "EUR"):
+                lab = "USD/SGD" if ccy == "USD" else f"USD/{ccy}"   # EUR/USD inverted so every pair is USD-base
+                usd_x[lab] = 1 / fx_px[tkr] if usd_quote else fx_px[tkr]
+        if "DX-Y.NYB" in fx_px.columns:
+            usd_x["DXY"] = fx_px["DX-Y.NYB"]
+    rets = np.log(usd_x.ffill(limit=3)).diff() if not usd_x.empty else pd.DataFrame()
+
+    fig_beta = go.Figure()
+    beta_df = pd.DataFrame()
+    if not rets.empty and "USD/SGD" in rets:
+        for drv, col in [("DXY", "#ff9800"), ("USD/CNY", "#ef5350"), ("USD/MYR", "#26a69a")]:
+            if drv in rets:
+                pair = rets[["USD/SGD", drv]].dropna()
+                beta_df[f"β to {drv}"] = pair["USD/SGD"].rolling(60).cov(pair[drv]) / pair[drv].rolling(60).var()
+        for c_, col in zip(beta_df.columns, ["#ff9800", "#ef5350", "#26a69a"]):
+            zline(fig_beta, beta_df[c_], c_, color=col)
+    fig_beta.update_layout(**base_layout("USD/SGD Rolling 60D Beta to DXY / USD-CNY / USD-MYR"))
+
+    fig_corr = go.Figure()
+    corr = pd.DataFrame()
+    if not rets.empty:
+        corr = rets[rets.index >= rets.index[-1] - pd.DateOffset(months=3)].corr()
+        fig_corr.add_trace(go.Heatmap(z=corr.values, x=corr.columns, y=corr.index, zmin=-1, zmax=1,
+                                      colorscale=[[0, "#ef5350"], [0.5, PLOT_BG], [1, "#26a69a"]],
+                                      text=corr.round(2).values, texttemplate="%{text:.2f}", textfont=dict(size=9),
+                                      showscale=False))
+    fig_corr.update_layout(**base_layout("3M Correlation of Daily Returns — USD vs Asia FX", height=520))
+
+    # Covered-interest-parity forward points & carry (bill-implied, not dealer quotes)
+    fig_fwd = go.Figure()
+    fig_carry = go.Figure()
+    fwd_df = pd.DataFrame()
+    if not usdsgd.empty and not ust.empty and not sgs.empty:
+        for lab, sg_c, us_c, days in [("6M", "6M", "6M", 182), ("12M", "1Y", "1Y", 365)]:
+            f_ = pd.concat([usdsgd, _col(sgs, sg_c), _col(ust, us_c)], axis=1, keys=["S", "rs", "ru"]).ffill(limit=3).dropna()
+            fwd = f_["S"] * (1 + f_["rs"] / 100 * days / 365) / (1 + f_["ru"] / 100 * days / 360)
+            fwd_df[f"{lab} fwd pts (pips)"] = (fwd - f_["S"]) * 1e4
+            fwd_df[f"{lab} USD−SGD rate diff (pp)"] = f_["ru"] - f_["rs"]
+        for c_, col in [("6M fwd pts (pips)", "#42a5f5"), ("12M fwd pts (pips)", "#26a69a")]:
+            zline(fig_fwd, fwd_df[c_], c_, color=col, fmt=".0f")
+        vol3 = realized_vol(usdsgd, 63)
+        cv = pd.concat([fwd_df["12M USD−SGD rate diff (pp)"], vol3], axis=1, keys=["diff", "vol"]).dropna()
+        zline(fig_carry, cv["diff"], "Long USD/SGD carry (% p.a.)", color="#ff9800", unit="%")
+        zline(fig_carry, cv["diff"] / cv["vol"], "Carry / 3M realized vol", color="#90a4d4", yaxis="y2")
+        fwd_df["Carry/Vol (12M)"] = cv["diff"] / cv["vol"]
+    fig_fwd.add_hline(y=0, line_dash="dot", line_color="#555")
+    fig_fwd.update_layout(**base_layout("USD/SGD Implied Forward Points (SGS bills vs UST bills, CIP)"))
+    fig_carry.update_layout(**dual_axis_layout("USD/SGD Carry (12M rate differential) & Carry-to-Vol",
+                                               "Carry (% p.a.)", "Carry / Vol"))
+
+    # MAS intervention proxy: FX reserves change in USD (removes USD/SGD translation effects)
+    fig_resv = go.Figure()
+    resv_df = pd.DataFrame()
+    fx_res = fetch_singstat("M700031", "Official Foreign Reserves", n_periods=400)
+    if not fx_res.empty and not usdsgd.empty:
+        me_fx = usdsgd.resample("MS").last()
+        resv_df = pd.DataFrame({"Reserves (S$M)": fx_res["Official Foreign Reserves"]}).join(me_fx.rename("USDSGD"), how="left")
+        resv_df["Reserves (US$B)"] = resv_df["Reserves (S$M)"] / resv_df["USDSGD"] / 1000
+        resv_df["MoM Δ (US$B)"] = resv_df["Reserves (US$B)"].diff()
+        if not neer_w.empty:
+            resv_df["S$NEER MoM %"] = neer_w.resample("MS").mean().pct_change() * 100
+        rc = clip(resv_df)
+        fig_resv.add_trace(go.Bar(x=rc.index, y=rc["MoM Δ (US$B)"], name="Reserves MoM Δ (US$B)",
+                                  marker_color=["#26a69a" if v >= 0 else "#ef5350" for v in rc["MoM Δ (US$B)"].fillna(0)]))
+        if "S$NEER MoM %" in rc:
+            fig_resv.add_trace(go.Scatter(x=rc.index, y=rc["S$NEER MoM %"], name="S$NEER MoM %", yaxis="y2",
+                                          line=dict(color="#ff9800", width=1.6)))
+    fig_resv.update_layout(**dual_axis_layout("MAS Intervention Proxy — FX Reserves Change (US$B) vs S$NEER",
+                                              "US$ Billion", "S$NEER MoM %"))
+
+    fig_w = go.Figure()
+    if neer_weights is not None:
+        nw_ = neer_weights[neer_weights > 0.001].sort_values()
+        fig_w.add_trace(go.Bar(x=nw_.values * 100, y=[FX_DISPLAY[c] for c in nw_.index], orientation="h",
+                               marker_color="#90a4d4", text=[f"{v * 100:.1f}%" for v in nw_.values], textposition="outside"))
+    fig_w.update_layout(**base_layout(f"S$NEER Model — Implied Basket Weights (R² {neer_r2:.2f}, "
+                                      f"{neer_cal0:%b %Y}–{neer_cal1:%b %Y})" if neer_weights is not None else
+                                      "S$NEER Model — Implied Basket Weights", height=480))
+    fig_w.update_xaxes(ticksuffix="%")
+
+    render_two_col([
+        ("S$NEER Deviation from Est Mid", fig_dev, band_df),
+        ("USD-SGD Spot", fig_usdsgd, clip(usdsgd.to_frame("USD/SGD")) if not usdsgd.empty else None),
+        ("SGD Performance Heatmap", fig_perf, perf),
+        ("Realized Vol", fig_rvol, clip(rvol_df) if not rvol_df.empty else None),
+        ("SGD Rebased Crosses", fig_rebase, None),
+        ("USD-SGD Beta", fig_beta, clip(beta_df) if not beta_df.empty else None),
+        ("USD-Asia Correlation", fig_corr, corr),
+        ("S$NEER Model Weights", fig_w, neer_weights.to_frame("weight") if neer_weights is not None else None),
+        ("USD-SGD Forward Points", fig_fwd, clip(fwd_df) if not fwd_df.empty else None),
+        ("USD-SGD Carry", fig_carry, None),
+        ("MAS Intervention Proxy", fig_resv, clip(resv_df) if not resv_df.empty else None),
+    ])
+    st.caption("Forward points are theoretical covered-interest-parity values from SGS vs UST bill yields - real "
+               "dealer forwards also carry a cross-currency basis. Reserves change is measured in US\\$ to strip "
+               "USD/SGD translation, but still includes valuation moves on non-USD assets and investment returns, so "
+               "treat it as a proxy for intervention direction, not size.")
+
+    # FX monitor
+    st.markdown('<div class="section-header">FX Monitor</div>', unsafe_allow_html=True)
+    if not fcy.empty:
+        mon = []
+        series_map = {FX_DISPLAY[c]: display_quote(fcy, c) for c in fcy.columns}
+        strength_map = {FX_DISPLAY[c]: fcy[c] for c in fcy.columns}
+        if neer_model is not None:
+            series_map["S$NEER (model)"] = neer_model
+            strength_map["S$NEER (model)"] = neer_model
+        for lab, s_ in series_map.items():
+            s_, st_ = s_.dropna(), strength_map[lab].dropna()
+            if len(s_) < 260:
+                continue
+            z_ = _zscores(s_, Z_WINDOWS["D"])
+            mon.append({
+                "Pair": lab, "Last": s_.iloc[-1],
+                "SGD 1D %": (st_.iloc[-1] / st_.iloc[-2] - 1) * 100,
+                "SGD 1W %": (st_.iloc[-1] / st_.asof(st_.index[-1] - pd.Timedelta(days=7)) - 1) * 100,
+                "SGD 1M %": (st_.iloc[-1] / st_.asof(st_.index[-1] - pd.DateOffset(months=1)) - 1) * 100,
+                "Z 1M": z_["1M"], "Z 3M": z_["3M"], "Z 1Y": z_["1Y"],
+                "1Y %ile": _pctile(s_, 1), "1M RVol %": realized_vol(s_, 21).iloc[-1],
+            })
+        mon_df = pd.DataFrame(mon)
+        sty = (mon_df.style
+               .format({"Last": "{:,.4f}", "SGD 1D %": "{:+.2f}", "SGD 1W %": "{:+.2f}", "SGD 1M %": "{:+.2f}",
+                        "Z 1M": "{:+.2f}", "Z 3M": "{:+.2f}", "Z 1Y": "{:+.2f}", "1Y %ile": "{:.0f}", "1M RVol %": "{:.1f}"},
+                       na_rep="—")
+               .map(_chgcolor, subset=["SGD 1D %", "SGD 1W %", "SGD 1M %"])
+               .map(_zcolor, subset=["Z 1M", "Z 3M", "Z 1Y"])
+               .map(_pctcolor, subset=["1Y %ile"]))
+        st.dataframe(sty, hide_index=True, use_container_width=True, height=36 * (len(mon_df) + 1))
+        st.caption("\"SGD x %\" columns are always SGD strength (+ = SGD appreciated vs that currency), regardless "
+                   "of how the pair is quoted. Z-scores and percentile are on the quoted level.")
+        csv_download(mon_df, "sg_fx_monitor")
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 2 — SGS & Rates
+# ════════════════════════════════════════════════════════════════════════════════
+with tabs[1]:
+    st.header("SGS & Rates")
+    st.caption("SGS benchmark yields from MAS's daily benchmark-issue history (back to 2008), UST from treasury.gov, "
+               "SOFR from the NY Fed. Hover any line for that day's trailing 1Y z-score. MAS no longer quotes a 3M or "
+               "7Y benchmark, so the curve runs 6M → 50Y.")
+
+    # Rates monitor
+    st.markdown('<div class="section-header">Rates Monitor</div>', unsafe_allow_html=True)
+    rm_items = [("SORA", sora, "%"), ("3M Comp. SORA", csora3, "%"), ("6M T-Bill", bill6, "%"), ("1Y T-Bill", bill12, "%")]
+    rm_items += [(f"{t} SGS", _col(sgs, t), "%") for t in ("2Y", "5Y", "10Y", "15Y", "20Y", "30Y", "50Y")]
+    rm_items += [(k, v, "bps") for k, v in SPREADS.items()]
+    rm_items += [("2Y SGS − UST", sgs_ust_2, "bps"), ("10Y SGS − UST", sgs_ust_10, "bps"), ("SORA − SOFR", sora_sofr, "bps")]
+    rm_rows = []
+    for name, s_, unit in rm_items:
+        s_ = s_.dropna()
+        if len(s_) < 30:
+            continue
+        m_ = 100 if unit == "%" else 1
+        z_ = _zscores(s_, Z_WINDOWS["D"])
+        rm_rows.append({
+            "Instrument": name, "Last": f"{s_.iloc[-1]:.3f}%" if unit == "%" else f"{s_.iloc[-1]:+.1f}bp",
+            "Δ1D": (s_.iloc[-1] - s_.iloc[-2]) * m_, "Δ1W": _change_over(s_, pd.Timedelta(days=7)) * m_,
+            "Δ1M": _change_over(s_, pd.DateOffset(months=1)) * m_, "Δ3M": _change_over(s_, pd.DateOffset(months=3)) * m_,
+            "Z 1M": z_["1M"], "Z 3M": z_["3M"], "Z 1Y": z_["1Y"],
+            "1Y %ile": _pctile(s_, 1), "5Y %ile": _pctile(s_, 5), "As of": s_.index[-1].strftime("%d %b"),
+        })
+    rm_df = pd.DataFrame(rm_rows)
+    if not rm_df.empty:
+        chg_cols = ["Δ1D", "Δ1W", "Δ1M", "Δ3M"]
+        sty = (rm_df.style
+               .format({**{c: "{:+.1f}" for c in chg_cols}, "Z 1M": "{:+.2f}", "Z 3M": "{:+.2f}", "Z 1Y": "{:+.2f}",
+                        "1Y %ile": "{:.0f}", "5Y %ile": "{:.0f}"}, na_rep="—")
+               .map(_chgcolor, subset=chg_cols)
+               .map(_zcolor, subset=["Z 1M", "Z 3M", "Z 1Y"])
+               .map(_pctcolor, subset=["1Y %ile", "5Y %ile"]))
+        st.dataframe(sty, hide_index=True, use_container_width=True, height=36 * (len(rm_df) + 1))
+        st.caption("Changes in bps. Percentile = where today's level sits in its own trailing 1Y / 5Y range.")
+        csv_download(rm_df, "sg_rates_monitor")
+
+    # Curve snapshots & changes
+    live_tenors = [t for t in sgs.columns if sgs[t].iloc[-60:].notna().any()] if not sgs.empty else []
+    curve = sgs[live_tenors].dropna(how="all").ffill(limit=3) if live_tenors else pd.DataFrame()
+    fig_yc = go.Figure()
+    fig_yc_chg = go.Figure()
+    snap_rows = {}
+    if not curve.empty:
+        snaps = {"Latest": 0, "1D Ago": -1, "1W Ago": -5, "1M Ago": -21, "3M Ago": -63}
+        colors_ = {"Latest": "cyan", "1D Ago": "magenta", "1W Ago": "orange", "1M Ago": "green", "3M Ago": "#90a4d4"}
+        for lab, off in snaps.items():
+            row = curve.iloc[max(0, len(curve) - 1 + off)]
+            snap_rows[f"{lab} ({row.name:%Y-%m-%d})"] = row
+            fig_yc.add_trace(go.Scatter(x=live_tenors, y=row.values, mode="lines+markers", name=f"{lab} ({row.name:%d %b})",
+                                        line=dict(color=colors_[lab], width=2 if lab == "Latest" else 1,
+                                                  dash="solid" if lab == "Latest" else "dash")))
+            if lab != "Latest":
+                if lab == "3M Ago":
+                    continue
+                fig_yc_chg.add_trace(go.Bar(x=live_tenors, y=(curve.iloc[-1] - row).values * 100, name=lab,
+                                            marker_color=colors_[lab], opacity=0.85))
+    fig_yc.update_layout(**base_layout("SGS Yield Curve — Snapshots"))
+    fig_yc.update_yaxes(ticksuffix="%")
+    fig_yc_chg.add_hline(y=0, line_dash="dot", line_color="#555")
+    fig_yc_chg.update_layout(**base_layout("SGS Curve Changes (bps)"), barmode="group")
+    fig_yc_chg.update_yaxes(ticksuffix=" bps")
+
+    fig_yields = go.Figure()
+    for t, c_ in [("6M", "#8a94a6"), ("2Y", "#42a5f5"), ("5Y", "#26a69a"), ("10Y", "#ff9800"), ("20Y", "#ab47bc"), ("30Y", "#ef5350")]:
+        zline(fig_yields, _col(sgs, t), f"{t} SGS", color=c_, unit="%")
+    add_mps_lines(fig_yields)
+    fig_yields.update_layout(**base_layout("SGS Benchmark Yields"))
+    fig_yields.update_yaxes(ticksuffix="%")
+
+    fig_spreads = go.Figure()
+    for (k_, v_), c_ in zip(SPREADS.items(), ["#42a5f5", "#26a69a", "#ab47bc", "#ffd54f", "#8a94a6", "#ff9800"]):
+        zline(fig_spreads, v_, k_, color=c_, unit=" bps", fmt=".1f")
+    fig_spreads.add_hline(y=0, line_dash="dot", line_color="#555")
+    fig_spreads.update_layout(**base_layout("SGS Curve Spreads & 2s5s10s Butterfly (bps)"))
+    fig_spreads.update_yaxes(ticksuffix=" bps")
+
+    # 1Y rolldown history (on the clipped range only - one interpolation per day)
+    fig_roll = go.Figure()
+    roll_df = pd.DataFrame()
+    roll_tenors = [t for t in ("2Y", "5Y", "10Y", "15Y", "20Y", "30Y") if t in live_tenors]
+    if roll_tenors:
+        roll_df = rolldown_series(clip(curve), roll_tenors, 1.0)
+        for t in roll_tenors:
+            fig_roll.add_trace(go.Scatter(x=roll_df.index, y=roll_df[t], name=t, mode="lines",
+                                          hovertemplate=f"%{{x|%Y-%m-%d}}<br>{t} 1Y roll: %{{y:.1f}} bps<extra></extra>"))
+    fig_roll.add_hline(y=0, line_dash="dot", line_color="#555")
+    fig_roll.update_layout(**base_layout("Outright SGS — 1Y Rolldown (bps)"))
+    fig_roll.update_yaxes(ticksuffix=" bps")
+
+    # Carry + roll snapshot (3M horizon, funded at 3M compounded SORA)
+    fig_cr = go.Figure()
+    cr_df = pd.DataFrame()
+    if roll_tenors and not csora3.empty:
+        last_curve = curve.iloc[-1]
+        fund = float(csora3.iloc[-1])
+        rows_ = []
+        for t in roll_tenors:
+            yT = float(last_curve[t])
+            carry = (yT - fund) * 100 * 0.25
+            roll = float(curve_interp(last_curve, [SGS_TENOR_YEARS[t]])[0] - curve_interp(last_curve, [SGS_TENOR_YEARS[t] - 0.25])[0]) * 100
+            vol = sgs[t].dropna().diff().iloc[-63:].std() * 100 * np.sqrt(63)
+            rows_.append({"Tenor": t, "Yield %": yT, "Carry (bps, 3M)": carry, "Roll (bps, 3M)": roll,
+                          "Carry+Roll (bps)": carry + roll, "3M yield vol (bps)": vol,
+                          "Breakeven ratio": (carry + roll) / vol if vol else np.nan})
+        cr_df = pd.DataFrame(rows_)
+        fig_cr.add_trace(go.Bar(x=cr_df["Tenor"], y=cr_df["Carry (bps, 3M)"], name="Carry", marker_color="#42a5f5"))
+        fig_cr.add_trace(go.Bar(x=cr_df["Tenor"], y=cr_df["Roll (bps, 3M)"], name="Roll", marker_color="#26a69a"))
+        fig_cr.add_trace(go.Scatter(x=cr_df["Tenor"], y=cr_df["Breakeven ratio"], name="(Carry+Roll) / 3M vol",
+                                    yaxis="y2", mode="lines+markers", line=dict(color="#ff9800", width=2)))
+        fig_cr.update_layout(**dual_axis_layout(f"SGS Carry + Roll, 3M Horizon (funded at 3M Comp. SORA {fund:.2f}%)",
+                                                "bps", "Carry+Roll / Vol"), barmode="relative")
+
+    fig_vs_ust = go.Figure()
+    zline(fig_vs_ust, sgs_ust_2, "2Y SGS − UST", color="#42a5f5", unit=" bps", fmt=".0f")
+    zline(fig_vs_ust, sgs_ust_10, "10Y SGS − UST", color="#ff9800", unit=" bps", fmt=".0f")
+    fig_vs_ust.update_layout(**base_layout("SGS − UST Yield Spreads (bps)"))
+    fig_vs_ust.update_yaxes(ticksuffix=" bps")
+
+    # Weekly-change beta to UST: Singapore closes ~12h before New York, so same-day daily
+    # changes mis-align; weekly changes sidestep the time-zone lag.
+    fig_ust_beta = go.Figure()
+    ust_beta = pd.DataFrame()
+    for t, c_ in [("2Y", "#42a5f5"), ("10Y", "#ff9800")]:
+        a_, b_ = _col(sgs, t), _col(ust, t)
+        if a_.empty or b_.empty:
+            continue
+        wk_ = pd.concat([a_, b_], axis=1, keys=["sg", "us"]).resample("W-FRI").last().diff().dropna()
+        ust_beta[f"{t} β"] = wk_["sg"].rolling(26).cov(wk_["us"]) / wk_["us"].rolling(26).var()
+        ust_beta[f"{t} corr"] = wk_["sg"].rolling(26).corr(wk_["us"])
+        bc_ = clip(ust_beta[f"{t} β"].dropna())
+        fig_ust_beta.add_trace(go.Scatter(x=bc_.index, y=bc_.values, name=f"{t} beta", line=dict(color=c_)))
+        cc_ = clip(ust_beta[f"{t} corr"].dropna())
+        fig_ust_beta.add_trace(go.Scatter(x=cc_.index, y=cc_.values, name=f"{t} corr", yaxis="y2",
+                                          line=dict(color=c_, dash="dot", width=1)))
+    fig_ust_beta.update_layout(**dual_axis_layout("SGS Beta & Correlation to UST (26W, weekly changes)", "Beta", "Correlation"))
+
+    # Ex-post real 10Y
+    fig_real = go.Figure()
+    real_df = pd.DataFrame()
+    if not y10.empty and not macro["Core Infl. YoY"].empty:
+        y10m = y10.resample("MS").mean()
+        real_df = pd.DataFrame({"10Y − Core YoY": y10m - macro["Core Infl. YoY"],
+                                "10Y − Headline YoY": y10m - macro["CPI YoY"]}).dropna(how="all")
+        zline(fig_real, real_df["10Y − Core YoY"], "10Y SGS − MAS Core YoY", freq="M", color="#26a69a", unit="%")
+        zline(fig_real, real_df["10Y − Headline YoY"], "10Y SGS − Headline CPI YoY", freq="M", color="#ef5350", unit="%", dash="dot")
+    fig_real.add_hline(y=0, line_dash="dot", line_color="#555")
+    fig_real.update_layout(**base_layout("Ex-Post Real 10Y SGS Yield (monthly avg)"))
+    fig_real.update_yaxes(ticksuffix="%")
+
+    render_two_col([
+        ("SGS Yield Curve Snapshots", fig_yc, pd.DataFrame(snap_rows).T if snap_rows else None),
+        ("SGS Curve Changes", fig_yc_chg, None),
+        ("SGS Benchmark Yields", fig_yields, clip(sgs)),
+        ("SGS Curve Spreads", fig_spreads, clip(pd.DataFrame(SPREADS))),
+        ("SGS 1Y Rolldown", fig_roll, roll_df),
+        ("SGS Carry and Roll", fig_cr, cr_df),
+        ("SGS vs UST Spreads", fig_vs_ust, clip(pd.DataFrame({"2Y": sgs_ust_2, "10Y": sgs_ust_10}))),
+        ("SGS Beta to UST", fig_ust_beta, clip(ust_beta) if not ust_beta.empty else None),
+        ("Ex-Post Real 10Y", fig_real, clip(real_df) if not real_df.empty else None),
+    ])
+    if not cr_df.empty:
+        st.dataframe(cr_df.style.format({c: "{:.2f}" for c in cr_df.columns if c != "Tenor"}),
+                     hide_index=True, use_container_width=True)
+        st.caption("Carry = (yield − 3M compounded SORA) × 3/12; roll = yield pickup from rolling 3 months down "
+                   "today's curve; breakeven ratio = (carry + roll) / 3M realized yield vol - how many standard "
+                   "deviations of adverse move the position can absorb over 3 months. Compounded SORA is "
+                   "backward-looking, so this is a funding proxy rather than a traded term rate.")
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 3 — Funding & Liquidity
+# ════════════════════════════════════════════════════════════════════════════════
+with tabs[2]:
+    st.header("Funding & Liquidity")
+
+    fig_mm = go.Figure()
+    for s_, n_, c_, d_ in [(sora, "SORA", "#90a4d4", None), (csora1, "1M Comp. SORA", "#42a5f5", "dot"),
+                           (csora3, "3M Comp. SORA", "#26a69a", "dot"), (csora6, "6M Comp. SORA", "#9ccc65", "dot"),
+                           (bill6, "6M T-Bill", "#ff9800", None), (bill12, "1Y T-Bill", "#ef5350", None)]:
+        zline(fig_mm, s_, n_, color=c_, unit="%", dash=d_, width=1.3)
+    add_mps_lines(fig_mm)
+    fig_mm.update_layout(**base_layout("SGD Money Markets — SORA, Compounded SORA, T-Bills"))
+    fig_mm.update_yaxes(ticksuffix="%")
+
+    fig_ss = go.Figure()
+    zline(fig_ss, sora, "SORA", color="#90a4d4", unit="%")
+    zline(fig_ss, sofr, "SOFR", color="#ef5350", unit="%")
+    zline(fig_ss, sora_sofr, "SORA − SOFR (bps)", color="#ff9800", unit=" bps", fmt=".0f", yaxis="y2", dash="dot")
+    fig_ss.update_layout(**dual_axis_layout("SORA vs SOFR & Spread", "Rate (%)", "Spread (bps)"))
+
+    fig_bill_ois = go.Figure()
+    bill_ois = _spread(bill6, csora6)
+    zline(fig_bill_ois, bill_ois, "6M T-Bill − 6M Comp. SORA", color="#26a69a", unit=" bps", fmt=".0f")
+    fig_bill_ois.add_hline(y=0, line_dash="dot", line_color="#555")
+    fig_bill_ois.update_layout(**base_layout("6M T-Bill vs 6M Compounded SORA (bps) — forward vs realised funding"))
+    fig_bill_ois.update_yaxes(ticksuffix=" bps")
+
+    fig_sora_vol = go.Figure()
+    sv = pd.DataFrame()
+    if not sora_all.empty and "SORA Volume" in sora_all:
+        sv = clip(sora_all[["SORA Volume", "SORA High", "SORA Low"]].dropna())
+        fig_sora_vol.add_trace(go.Bar(x=sv.index, y=sv["SORA Volume"], name="Volume (S$M)", marker_color="rgba(144,164,212,0.5)"))
+        fig_sora_vol.add_trace(go.Scatter(x=sv.index, y=(sv["SORA High"] - sv["SORA Low"]) * 100, name="High − Low (bps)",
+                                          yaxis="y2", line=dict(color="#ff9800", width=1.2)))
+    fig_sora_vol.update_layout(**dual_axis_layout("SORA Transaction Volume & Intraday Dispersion", "S$ Million", "bps"))
+
+    with st.spinner("Loading money supply & bank loans…"):
+        ms = {n_: fetch_singstat("M701111", n_, series_no=sn) for n_, sn in [("M1", "1.1.1"), ("M2", "1.1"), ("M3", "1")]}
+        loans = {n_: fetch_singstat("M701091", n_, series_no=sn) for n_, sn in
+                 [("Total Loans", "1"), ("Business Loans", "1.1"), ("Housing Loans", "1.2.1")]}
+        gov_revenue = fetch_singstat("M130501", "Government Operating Revenue")
+
+    fig_ms = go.Figure()
+    ms_yoy = pd.DataFrame({k_: v_[k_].pct_change(12) * 100 for k_, v_ in ms.items() if not v_.empty})
+    for c_, col in zip(ms_yoy.columns, ["#42a5f5", "#26a69a", "#ff9800"]):
+        zline(fig_ms, ms_yoy[c_], f"{c_} YoY", freq="M", color=col, unit="%")
+    fig_ms.add_hline(y=0, line_dash="dot", line_color="#555")
+    fig_ms.update_layout(**base_layout("Money Supply Growth — M1 / M2 / M3 YoY %"))
+    fig_ms.update_yaxes(ticksuffix="%")
+
+    fig_loans = go.Figure()
+    loans_yoy = pd.DataFrame({k_: v_[k_].pct_change(12) * 100 for k_, v_ in loans.items() if not v_.empty})
+    for c_, col in zip(loans_yoy.columns, ["#e0e0e0", "#42a5f5", "#ef5350"]):
+        zline(fig_loans, loans_yoy[c_], f"{c_} YoY", freq="M", color=col, unit="%")
+    fig_loans.add_hline(y=0, line_dash="dot", line_color="#555")
+    fig_loans.update_layout(**base_layout("Commercial Bank Loans to Residents — YoY %"))
+    fig_loans.update_yaxes(ticksuffix="%")
+
+    fig_reserves = go.Figure()
+    if not resv_df.empty:
+        rc = clip(resv_df)
+        fig_reserves.add_trace(go.Scatter(x=rc.index, y=rc["Reserves (S$M)"] / 1000, name="S$ Billion",
+                                          line=dict(color="#42a5f5"), fill="tozeroy", fillcolor="rgba(66,165,245,0.15)"))
+        fig_reserves.add_trace(go.Scatter(x=rc.index, y=rc["Reserves (US$B)"], name="US$ Billion", yaxis="y2",
+                                          line=dict(color="#ff9800", dash="dot")))
+    fig_reserves.update_layout(**dual_axis_layout("Official Foreign Reserves", "S$ Billion", "US$ Billion"))
+
+    fig_gov_rev = go.Figure()
+    gov_c = clip(gov_revenue)
+    if not gov_c.empty:
+        fig_gov_rev.add_trace(go.Bar(x=gov_c.index, y=gov_c["Government Operating Revenue"], name="Monthly",
+                                     marker_color="rgba(237,161,0,0.45)"))
+        r12 = clip(gov_revenue["Government Operating Revenue"].rolling(12).sum() / 12)
+        fig_gov_rev.add_trace(go.Scatter(x=r12.index, y=r12.values, name="12M avg", line=dict(color="#eda100", width=2)))
+    fig_gov_rev.update_layout(**base_layout("Government Operating Revenue (S$M, monthly + 12M avg)"))
+
+    render_two_col([
+        ("SGD Money Markets", fig_mm, clip(sora_all)),
+        ("SORA vs SOFR", fig_ss, clip(sora_sofr.to_frame("SORA-SOFR bps"))),
+        ("Bill vs Comp SORA", fig_bill_ois, clip(bill_ois.to_frame("bps"))),
+        ("SORA Volume", fig_sora_vol, sv),
+        ("Money Supply Growth", fig_ms, clip(ms_yoy)),
+        ("Bank Loans Growth", fig_loans, clip(loans_yoy)),
+        ("Official Foreign Reserves", fig_reserves, clip(resv_df) if not resv_df.empty else None),
+        ("Government Operating Revenue", fig_gov_rev, gov_c),
+    ])
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 4 — Supply & Auctions
+# ════════════════════════════════════════════════════════════════════════════════
+with tabs[3]:
+    st.header("Supply & Auctions")
+    with st.spinner("Loading SGS auction results…"):
+        auctions = load_sgs_auctions()
+        conc = auction_concessions(auctions, sgs) if not sgs.empty else pd.DataFrame()
+    tenor_bucket = _sg_true_original_tenor_bucket(auctions)
+
+    # Recent auctions table
+    st.markdown('<div class="section-header">Recent SGS Bond & T-Bill Auctions</div>', unsafe_allow_html=True)
+    if not conc.empty:
+        c_ = conc.copy()
+        c_["Tenor"] = c_["issue_code"].map(tenor_bucket)
+        c_ = c_.sort_values("auction_date")
+        c_["BTC z (vs last 12 same tenor)"] = c_.groupby("Tenor")["bid_to_cover"].transform(
+            lambda s: (s - s.rolling(12, min_periods=4).mean().shift()) / s.rolling(12, min_periods=4).std().shift())
+        recent = c_.sort_values("auction_date", ascending=False).head(25)
+        tbl = pd.DataFrame({
+            "Date": recent["auction_date"].dt.strftime("%Y-%m-%d"), "Issue": recent["issue_code"].str.strip(),
+            "Type": recent["bill_bond_ind"].str.title(), "Tenor": recent["Tenor"],
+            "Reopening": recent["reopened_issue"], "Size (S$B)": recent["total_amt_allot"].astype(float) / 1000,
+            "BTC": recent["bid_to_cover"], "BTC z": recent["BTC z (vs last 12 same tenor)"],
+            "Cutoff %": recent["cutoff_yield"], "Median %": pd.to_numeric(recent["median_yield"], errors="coerce"),
+            "Tail (bps)": recent["Tail (bps)"], "% at Cutoff": recent["pct_cmpt_appls_cutoff"],
+            "Concession (bps)": recent["Concession (bps)"],
+        })
+        sty = (tbl.style.format({"Size (S$B)": "{:.2f}", "BTC": "{:.2f}", "BTC z": "{:+.2f}", "Cutoff %": "{:.2f}",
+                                 "Median %": "{:.2f}", "Tail (bps)": "{:.0f}", "% at Cutoff": "{:.1f}",
+                                 "Concession (bps)": "{:+.1f}"}, na_rep="—")
+               .map(_zcolor, subset=["BTC z"])
+               .map(lambda v: _zcolor(v / 5) if pd.notna(v) else "color:#5f6b7e", subset=["Concession (bps)"]))
+        st.dataframe(sty, hide_index=True, use_container_width=True, height=36 * 12)
+        st.caption("Tail = cutoff − median yield. Concession = cutoff yield vs the previous day's benchmark curve "
+                   "interpolated at the issue's maturity (+ = cleared cheap to secondary; rough for off-the-run "
+                   "reopenings). BTC z compares each auction with the prior 12 auctions of the same original tenor.")
+        csv_download(tbl, "sgs_recent_auctions")
+
+    bonds_hist = clip(conc.set_index("auction_date")) if not conc.empty else pd.DataFrame()
+    if not bonds_hist.empty:
+        bonds_hist = bonds_hist[bonds_hist["bill_bond_ind"] == "bond"].copy()
+        bonds_hist["Tenor"] = bonds_hist["issue_code"].map(tenor_bucket)
+    fig_conc = go.Figure()
+    fig_tail = go.Figure()
+    if not bonds_hist.empty:
+        for t in sorted(bonds_hist["Tenor"].dropna().unique(), key=lambda x: _SG_LADDER_ORDER.get(x, 999)):
+            d_ = bonds_hist[bonds_hist["Tenor"] == t]
+            fig_conc.add_trace(go.Bar(x=d_.index, y=d_["Concession (bps)"], name=t,
+                                      customdata=d_["issue_code"], hovertemplate="%{x|%Y-%m-%d} %{customdata}: %{y:+.1f} bps<extra></extra>"))
+            fig_tail.add_trace(go.Scatter(x=d_.index, y=d_["Tail (bps)"], name=t, mode="markers",
+                                          marker=dict(size=7 + 3 * (d_["bid_to_cover"].fillna(1) - 1).clip(0, 3)),
+                                          customdata=np.column_stack([d_["issue_code"], d_["bid_to_cover"]]),
+                                          hovertemplate="%{x|%Y-%m-%d} %{customdata[0]}<br>Tail %{y:.0f} bps · BTC %{customdata[1]:.2f}<extra></extra>"))
+    fig_conc.add_hline(y=0, line_dash="dot", line_color="#555")
+    fig_conc.update_layout(**base_layout("SGS Bond Auction Concession vs Secondary Curve (bps)"))
+    fig_tail.update_layout(**base_layout("SGS Bond Auction Tails (bps, marker size = bid-to-cover)"))
+
+    # Outstanding ladder with the live curve overlaid
+    _, sg_outstanding_summary = get_sg_outstanding_by_remaining_maturity(auctions)
+    sg_ladder_labels = list(SG_MATURITY_LADDER.keys())
+    sg_pivot = sg_outstanding_summary.pivot_table(index="maturity_bucket", columns="category", values="amt_bil",
+                                                  aggfunc="sum").reindex(sg_ladder_labels).fillna(0)
+    fig_sg_outstanding = go.Figure()
+    for cat in sg_pivot.columns:
+        if sg_pivot[cat].sum() > 0:
+            fig_sg_outstanding.add_trace(go.Bar(x=sg_ladder_labels, y=sg_pivot[cat], name=cat,
+                                                marker_color=SG_CATEGORY_COLORS.get(cat, "#9e9e9e")))
+    if not curve.empty:
+        interp_ = curve_interp(curve.iloc[-1], list(SG_MATURITY_LADDER.values()))
+        fig_sg_outstanding.add_trace(go.Scatter(x=sg_ladder_labels, y=interp_, name="Yield (latest)", yaxis="y2",
+                                                mode="lines+markers", line=dict(color="cyan", width=2), marker=dict(size=4)))
+    fig_sg_outstanding.update_layout(**dual_axis_layout(
+        f"Outstanding SGS & T-Bills by Remaining Maturity (S${sg_pivot.values.sum():,.0f}B)", "S$ Billion", "Yield (%)"))
+    fig_sg_outstanding.update_layout(barmode="stack", yaxis2=dict(ticksuffix="%"))
+
+    net_issuance_days = st.select_slider("Net Issuance window (days)", options=[30, 60, 90, 180], value=90, key="sg_net_issuance_days")
+    net_issuance_df = get_sg_net_issuance(auctions, net_issuance_days)
+    fig_net_issuance = go.Figure()
+    if not net_issuance_df.empty:
+        fig_net_issuance.add_trace(go.Bar(x=net_issuance_df["tenor_bucket"], y=net_issuance_df["Issuance"], name="Issued", marker_color="#26a69a"))
+        fig_net_issuance.add_trace(go.Bar(x=net_issuance_df["tenor_bucket"], y=-net_issuance_df["Maturing"], name="Maturing", marker_color="#ef5350"))
+        fig_net_issuance.add_trace(go.Scatter(x=net_issuance_df["tenor_bucket"], y=net_issuance_df["Net"], name="Net",
+                                              mode="lines+markers", line=dict(color="#90a4d4", width=2)))
+    fig_net_issuance.update_layout(**base_layout(
+        f"Net Issuance — Issued (past {net_issuance_days}d) vs Maturing (next {net_issuance_days}d), "
+        f"Net S${net_issuance_df['Net'].sum() if not net_issuance_df.empty else 0:,.1f}B"), barmode="relative")
+
+    # Gross bond issuance by year & tenor
+    gb = auctions[auctions["bill_bond_ind"] == "bond"].copy()
+    gb["Tenor"] = gb["issue_code"].map(tenor_bucket)
+    gb["year"] = gb["auction_date"].dt.year
+    gb = gb[gb["year"] >= pd.Timestamp.today().year - 12]
+    gb_p = gb.pivot_table(index="year", columns="Tenor", values="total_amt_allot", aggfunc="sum").fillna(0) / 1000
+    gb_p = gb_p[sorted(gb_p.columns, key=lambda x: _SG_LADDER_ORDER.get(x, 999))]
+    fig_gross = go.Figure()
+    for t in gb_p.columns:
+        fig_gross.add_trace(go.Bar(x=gb_p.index.astype(str), y=gb_p[t], name=t))
+    fig_gross.update_layout(**base_layout("Gross SGS Bond Issuance by Year & Original Tenor (S$B, current year YTD)"),
+                            barmode="stack")
+
+    bc_type = st.selectbox("Bid-to-cover: instrument type", sorted(auctions["bill_bond_ind"].dropna().unique()), key="sg_bc_type")
+    bc_hist = auctions[(auctions["bill_bond_ind"] == bc_type) & auctions["bid_to_cover"].notna() &
+                       (auctions["auction_date"] >= START) & (auctions["auction_date"] <= END)].sort_values("auction_date").copy()
+    bc_hist["tenor_bucket"] = bc_hist["issue_code"].map(tenor_bucket)
+    fig_btc = go.Figure()
+    for term in sorted(bc_hist["tenor_bucket"].dropna().unique(), key=lambda t: _SG_LADDER_ORDER.get(t, 999)):
+        term_df = bc_hist[bc_hist["tenor_bucket"] == term]
+        fig_btc.add_trace(go.Scatter(x=term_df["auction_date"], y=term_df["bid_to_cover"], mode="lines+markers", name=term, marker=dict(size=4)))
+    fig_btc.update_layout(**base_layout(f"Bid-to-Cover Ratio — {bc_type.title()}s"))
+
+    render_two_col([
+        ("Auction Concession", fig_conc, bonds_hist[["issue_code", "Tenor", "Concession (bps)"]] if not bonds_hist.empty else None),
+        ("Auction Tails", fig_tail, bonds_hist[["issue_code", "Tenor", "Tail (bps)", "bid_to_cover"]] if not bonds_hist.empty else None),
+        ("Outstanding SGS by Remaining Maturity", fig_sg_outstanding, sg_pivot.reset_index()),
+        ("Net Issuance", fig_net_issuance, net_issuance_df),
+        ("Gross Bond Issuance", fig_gross, gb_p.reset_index()),
+        ("Bid-to-Cover Trend", fig_btc, bc_hist[["auction_date", "issue_code", "tenor_bucket", "bid_to_cover"]]),
+    ])
+
+    st.markdown('<div class="section-header">Upcoming SGS / T-Bill Issuance</div>', unsafe_allow_html=True)
+    st.caption("MAS doesn't publish the offering size at announcement - only once the auction closes - so this "
+               "shows tenor and dates only.")
+    cal_up = load_sgs_issuance_calendar()
+    days_ahead_bonds = st.select_slider("Forward-looking window (days)", options=[30, 60, 90, 180], value=90, key="sg_issuance_days")
+    _today = pd.Timestamp.today().normalize()
+    upcoming_cal = cal_up[(cal_up["auction_date"] >= _today) &
+                          (cal_up["auction_date"] <= _today + pd.Timedelta(days=days_ahead_bonds))].sort_values("auction_date")
+    st.dataframe(pd.DataFrame({
+        "Auction Date": upcoming_cal["auction_date"].dt.strftime("%Y-%m-%d (%a)"),
+        "Issue Date": upcoming_cal["issue_date"].dt.strftime("%Y-%m-%d"),
+        "Issue Code": upcoming_cal["issue_code"], "Tenor": upcoming_cal["auction_tenor_formatted"],
+        "Type": upcoming_cal["agency_custom_categories"]}), hide_index=True, use_container_width=True)
+    csv_download(upcoming_cal, "sgs_upcoming_issuance")
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 5 — Prices
+# ════════════════════════════════════════════════════════════════════════════════
+with tabs[4]:
     st.header("Prices")
     with st.spinner("Loading price data…"):
         cpi  = mom_yoy(fetch_singstat("M213751", "CPI"), "CPI", 12)
@@ -809,12 +1975,32 @@ with tabs[0]:
 
     fig_cpi = go.Figure()
     for col in pd.concat([cpi, core], axis=1).columns:
-        src = clip(pd.concat([cpi, core], axis=1))
-        ax = "y2" if "MoM" in col else "y"
-        fig_cpi.add_trace(go.Scatter(x=src.index, y=src[col], name=col, mode="lines",
-                                     yaxis=ax, line=dict(width=1.5 if "YoY" in col else 1,
-                                                          dash="solid" if "YoY" in col else "dot")))
-    fig_cpi.update_layout(**dual_axis_layout("Headline CPI vs MAS Core Inflation", "YoY %", "MoM %"))
+        full = pd.concat([cpi, core], axis=1)[col]
+        if "YoY" in col:
+            zline(fig_cpi, full, col, freq="M", unit="%", width=1.8)
+        else:
+            src = clip(full.dropna())
+            fig_cpi.add_trace(go.Scatter(x=src.index, y=src.values, name=col, mode="lines", yaxis="y2",
+                                         line=dict(width=1, dash="dot")))
+    fig_cpi.update_layout(**dual_axis_layout("Headline CPI vs MAS Core Inflation (hover: 36M z-score)", "YoY %", "MoM %"))
+
+    # Momentum: 3M-average MoM annualised vs YoY. SingStat CPI is not seasonally adjusted, so
+    # this is noisier than a US-style SA 3m/3m - read the direction, not single prints.
+    fig_mom = go.Figure()
+    mom_df = pd.DataFrame()
+    if "CPI MoM %" in cpi and "Core MoM %" in core:
+        mom_df = pd.DataFrame({
+            "Core 3M ann.": ((1 + core["Core MoM %"] / 100).rolling(3).apply(np.prod, raw=True) ** 4 - 1) * 100,
+            "Core 6M ann.": ((1 + core["Core MoM %"] / 100).rolling(6).apply(np.prod, raw=True) ** 2 - 1) * 100,
+            "Core YoY": core["Core YoY %"],
+            "Headline 3M ann.": ((1 + cpi["CPI MoM %"] / 100).rolling(3).apply(np.prod, raw=True) ** 4 - 1) * 100,
+        })
+        for c_, col, d_ in [("Core 3M ann.", "#ff9800", None), ("Core 6M ann.", "#26a69a", None),
+                            ("Core YoY", "#e0e0e0", "dot"), ("Headline 3M ann.", "#ef5350", "dot")]:
+            zline(fig_mom, mom_df[c_], c_, freq="M", color=col, unit="%", dash=d_)
+    fig_mom.add_hline(y=2, line_dash="dash", line_color="#555", annotation_text="2%", annotation_position="top left")
+    fig_mom.update_layout(**base_layout("Inflation Momentum — 3M / 6M Annualised vs YoY (NSA)"))
+    fig_mom.update_yaxes(ticksuffix="%")
 
     fig_rsi = go.Figure()
     src = clip(rsi)
@@ -859,6 +2045,7 @@ with tabs[0]:
 
     render_two_col([
         ("CPI vs Core Inflation", fig_cpi, clip(pd.concat([cpi, core], axis=1))),
+        ("Inflation Momentum", fig_mom, clip(mom_df) if not mom_df.empty else None),
         ("Retail Sales Index", fig_rsi, clip(rsi)),
         ("CPI Components History", fig_cpi_comp_hist, pd.concat([cpi_components_sg[l] for l, _ in CPI_GROUPS_SG], axis=1)),
         ("CPI Components Snapshot", fig_cpi_comp_snap, comp_df_sg),
@@ -920,9 +2107,23 @@ with tabs[0]:
         fig_sg_sens.update_layout(**base_layout("Price-Sensitive Areas — YoY %"))
         fig_sg_sens.update_yaxes(ticksuffix="%")
 
+        # Diffusion: how broad-based inflation is across the >=1%-weight classes (unweighted share)
+        diff_codes = [k for kids in CPI_KIDS_SG.values() for k in kids if k in cpi_yoy_sg.columns]
+        cls_yoy = cpi_yoy_sg[diff_codes].dropna(how="all")
+        diffusion = pd.DataFrame({
+            "% of classes YoY > 2%": (cls_yoy > 2).sum(axis=1) / cls_yoy.notna().sum(axis=1) * 100,
+            "% of classes YoY > 0%": (cls_yoy > 0).sum(axis=1) / cls_yoy.notna().sum(axis=1) * 100,
+        }).dropna()
+        fig_diff = go.Figure()
+        zline(fig_diff, diffusion["% of classes YoY > 2%"], "% of classes YoY > 2%", freq="M", color="#ef5350", unit="%", fmt=".0f")
+        zline(fig_diff, diffusion["% of classes YoY > 0%"], "% of classes YoY > 0%", freq="M", color="#26a69a", unit="%", fmt=".0f")
+        fig_diff.update_layout(**base_layout(f"CPI Diffusion — Breadth Across {len(diff_codes)} Major Classes"))
+        fig_diff.update_yaxes(ticksuffix="%", range=[0, 100])
+
         render_two_col([
             ("SG CPI Contribution by Division", fig_sg_contrib, pd.DataFrame(contrib_cols_sg)),
             ("SG CPI Price-Sensitive YoY", fig_sg_sens, pd.DataFrame(sens_cols_sg)),
+            ("SG CPI Diffusion", fig_diff, clip(diffusion)),
         ])
 
         snap_rows_sg = []
@@ -970,9 +2171,9 @@ with tabs[0]:
             csv_download(drv_table_sg, "SG CPI Price-Sensitive Drivers")
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 2 — Growth & Labour
+# TAB 6 — Growth & Labour
 # ════════════════════════════════════════════════════════════════════════════════
-with tabs[1]:
+with tabs[5]:
     st.header("Growth & Labour")
     with st.spinner("Loading growth & labour data…"):
         gdp_level = fetch_singstat("M014871", "GDP (S$M)")
@@ -1047,19 +2248,56 @@ with tabs[1]:
     fig_job_vac.update_layout(**base_layout("Job Vacancy Rate"))
     fig_job_vac.update_yaxes(ticksuffix="%")
 
+    # Contribution to real GDP YoY by industry (pp) - bars sum to headline real GDP growth
+    GDP_CONTRIB_ROWS = {
+        "1.1.1": "Manufacturing", "1.1.2": "Construction", "1.2.1": "Wholesale & Retail",
+        "1.2.2": "Transport & Storage", "1.2.3": "Accom. & F&B", "1.2.4": "Info & Comms",
+        "1.2.5": "Finance & Insurance", "1.2.6": "Real Estate & Prof. Svcs", "1.2.7": "Other Services",
+        "1.1.3": "Utilities", "1.1.4": "Other Goods", "1.3": "Ownership of Dwellings", "1.4": "Taxes on Products",
+    }
+    gdp_contrib = fetch_singstat_multi("M015671", ("1",) + tuple(GDP_CONTRIB_ROWS))
+    fig_gdp_contrib = go.Figure()
+    if not gdp_contrib.empty:
+        gc = clip(gdp_contrib)
+        palette = ["#42a5f5", "#ff9800", "#26a69a", "#ab47bc", "#ffd54f", "#4fc3f7", "#ef5350",
+                   "#9ccc65", "#8a94a6", "#5c6bc0", "#8d6e63", "#f06292", "#607d8b"]
+        for (code, name), col in zip(GDP_CONTRIB_ROWS.items(), palette):
+            if code in gc:
+                fig_gdp_contrib.add_trace(go.Bar(x=gc.index, y=gc[code], name=name, marker_color=col,
+                                                 customdata=qlabels(gc.index),
+                                                 hovertemplate=f"%{{customdata}} {name}: %{{y:+.2f}}pp<extra></extra>"))
+        if "1" in gc:
+            fig_gdp_contrib.add_trace(go.Scatter(x=gc.index, y=gc["1"], name="Real GDP YoY", mode="lines+markers",
+                                                 line=dict(color="white", width=2), customdata=qlabels(gc.index),
+                                                 hovertemplate="%{customdata} GDP: %{y:.1f}%<extra></extra>"))
+    fig_gdp_contrib.update_layout(**base_layout("Contribution to Real GDP YoY by Industry (pp)", height=520), barmode="relative")
+    fig_gdp_contrib.update_yaxes(ticksuffix="pp")
+
+    fig_unemp_z = go.Figure()
+    if not unemp.empty:
+        zline(fig_unemp_z, unemp["Unemployment Rate"], "Unemployment Rate", freq="Q", color="#ef5350", unit="%", label_fn=qlabels)
+    if not job_vac.empty:
+        zline(fig_unemp_z, job_vac["Job Vacancy Rate"], "Job Vacancy Rate", freq="Q", color="#26a69a", unit="%",
+              label_fn=qlabels, yaxis="y2")
+    fig_unemp_z.update_layout(**dual_axis_layout("Labour Market Tightness — Unemployment vs Vacancy Rate",
+                                                 "Unemployment %", "Vacancy rate %"))
+
+    st.plotly_chart(fig_gdp_contrib, use_container_width=True, key="chart_gdp_contrib")
+    csv_download(gdp_contrib.rename(columns={"1": "Real GDP YoY", **GDP_CONTRIB_ROWS}), "sg_gdp_contribution")
     render_two_col([
         ("GDP Level vs YoY", fig_gdp, pd.concat([g_level, g_yoy], axis=1)),
         ("GDP QoQ SAAR", fig_saar, g_saar),
         ("Unemployment Rate", fig_unemp, u),
         ("Employment Change", fig_emp, e),
         ("Job Vacancy Rate", fig_job_vac, jv),
+        ("Labour Market Tightness", fig_unemp_z, None),
     ])
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 3 — Trade & Production
+# TAB 7 — Trade & Activity
 # ════════════════════════════════════════════════════════════════════════════════
-with tabs[2]:
-    st.header("Trade & Production")
+with tabs[6]:
+    st.header("Trade & Activity")
     st.caption("Singapore-specific external-facing indicators, plus property prices below — SingStat does "
                "publish real housing price indices (HDB resale + private residential), just at quarterly "
                "granularity rather than the US dashboard's monthly Case-Shiller.")
@@ -1100,247 +2338,61 @@ with tabs[2]:
                                           hovertemplate="%{customdata}: %{y:.1f}<extra></extra>"))
     fig_property.update_layout(**base_layout("HDB Resale vs Private Residential Property Price Index (1Q2009 = 100)"))
 
+    # NODX by destination - 3M-sum YoY smooths SG's very lumpy monthly (pharma/petchem) shipments
+    NODX_MKTS = {"1.10": "China", "1.11": "US", "1.13": "EU", "1.9": "Taiwan", "1.8": "Korea",
+                 "1.7": "Hong Kong", "1.6": "Japan", "1.3": "Malaysia", "1.2": "Indonesia", "1.5": "Thailand"}
+    nodx_mkt = fetch_singstat_multi("M451301", tuple(NODX_MKTS))
+    fig_nodx_mkt = go.Figure()
+    fig_nodx_mkt_hist = go.Figure()
+    nodx_mkt_yoy = pd.DataFrame()
+    if not nodx_mkt.empty:
+        nodx_mkt_yoy = (nodx_mkt.rolling(3).sum().pct_change(12) * 100).rename(columns=NODX_MKTS)
+        latest_ = nodx_mkt_yoy.dropna(how="all").iloc[-1].dropna().sort_values()
+        fig_nodx_mkt.add_trace(go.Bar(x=latest_.values, y=latest_.index, orientation="h",
+                                      marker_color=["#26a69a" if v >= 0 else "#ef5350" for v in latest_.values],
+                                      text=[f"{v:+.1f}%" for v in latest_.values], textposition="outside"))
+        fig_nodx_mkt.update_layout(**base_layout(
+            f"NODX by Market — 3M YoY % ({nodx_mkt_yoy.dropna(how='all').index[-1]:%b %Y})", height=480))
+        fig_nodx_mkt.update_xaxes(ticksuffix="%")
+        for m_, col in [("China", "#ef5350"), ("US", "#42a5f5"), ("EU", "#ffd54f"), ("Taiwan", "#26a69a")]:
+            zline(fig_nodx_mkt_hist, nodx_mkt_yoy[m_], m_, freq="M", color=col, unit="%", fmt=".1f")
+    fig_nodx_mkt_hist.add_hline(y=0, line_dash="dot", line_color="#555")
+    fig_nodx_mkt_hist.update_layout(**base_layout("NODX to Key Markets — 3M YoY %"))
+    fig_nodx_mkt_hist.update_yaxes(ticksuffix="%")
+
+    fig_prop_yoy = go.Figure()
+    prop_yoy = pd.DataFrame()
+    if not hdb_rpi.empty and not private_ppi.empty:
+        prop_yoy = pd.concat([hdb_rpi, private_ppi], axis=1).pct_change(4) * 100
+        zline(fig_prop_yoy, prop_yoy["HDB Resale (Public)"], "HDB Resale YoY", freq="Q", color="#42a5f5", unit="%", label_fn=qlabels)
+        zline(fig_prop_yoy, prop_yoy["Private Residential"], "Private Residential YoY", freq="Q", color="#ef5350", unit="%", label_fn=qlabels)
+    fig_prop_yoy.add_hline(y=0, line_dash="dot", line_color="#555")
+    fig_prop_yoy.update_layout(**base_layout("Property Prices — YoY %"))
+    fig_prop_yoy.update_yaxes(ticksuffix="%")
+
+    visitors = fetch_singstat("M550001", "Visitor Arrivals")
+    fig_vis = go.Figure()
+    if not visitors.empty:
+        vc = clip(visitors)
+        fig_vis.add_trace(go.Bar(x=vc.index, y=vc["Visitor Arrivals"] / 1e6, name="Arrivals (M)", marker_color="rgba(144,164,212,0.5)"))
+        v_yoy = visitors["Visitor Arrivals"].pct_change(12) * 100
+        zline(fig_vis, v_yoy, "YoY %", freq="M", color="#ff9800", unit="%", fmt=".1f", yaxis="y2")
+    fig_vis.update_layout(**dual_axis_layout("International Visitor Arrivals", "Millions", "YoY %"))
+
     render_two_col([
         ("NODX", fig_nodx, clip(nodx)),
         ("Industrial Production Index", fig_ipi, clip(ipi)),
+        ("NODX by Market", fig_nodx_mkt, nodx_mkt_yoy.tail(1).T if not nodx_mkt_yoy.empty else None),
+        ("NODX Key Markets History", fig_nodx_mkt_hist, clip(nodx_mkt_yoy) if not nodx_mkt_yoy.empty else None),
         ("Property Price Index", fig_property, pd.concat([hdb_c, priv_c], axis=1)),
+        ("Property Price YoY", fig_prop_yoy, clip(prop_yoy) if not prop_yoy.empty else None),
+        ("Visitor Arrivals", fig_vis, clip(visitors)),
     ])
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 4 — SGD & Rates
+# TAB 8 — Dividends
 # ════════════════════════════════════════════════════════════════════════════════
-with tabs[3]:
-    st.header("SGD & Rates")
-    st.info("No Fed-Funds-style hike/cut probability section here — MAS doesn't set a policy interest rate. "
-             "It manages monetary policy via the S\\$NEER exchange-rate band, reviewed at scheduled Monetary "
-             "Policy Statements (see the Economic Calendar tab), so there's no futures-implied-probability "
-             "market to build that chart from. SORA below is the key overnight benchmark, not a policy lever. "
-             "Note MAS does not disclose the band's width or slope - only the index level itself is published.")
-
-    with st.spinner("Loading S\\$NEER…"):
-        neer = fetch_sneer()
-    n = clip(neer)
-    fig_neer = go.Figure()
-    if not n.empty:
-        fig_neer.add_trace(go.Scatter(x=n.index, y=n["S$NEER"], name="S$NEER", line=dict(color="#ff9800")))
-    fig_neer.update_layout(**base_layout("S$NEER — Nominal Effective Exchange Rate Index (Jan 1999 = 100, Weekly)"))
-
-    neer_wow = pd.DataFrame(index=n.index)
-    fig_neer_wow = go.Figure()
-    if not n.empty:
-        neer_wow["WoW %"] = (n["S$NEER"].pct_change() * 100).round(3)
-        neer_wow["WoW % (4W MA)"] = neer_wow["WoW %"].rolling(4).mean().round(3)
-        fig_neer_wow.add_trace(go.Bar(x=neer_wow.index, y=neer_wow["WoW %"],
-                                       marker_color=["#26a69a" if v >= 0 else "#ef5350" for v in neer_wow["WoW %"].fillna(0)],
-                                       name="WoW %", opacity=0.6))
-        fig_neer_wow.add_trace(go.Scatter(x=neer_wow.index, y=neer_wow["WoW % (4W MA)"],
-                                           name="WoW % (4W MA)", line=dict(color="white", width=2)))
-    fig_neer_wow.add_hline(y=0, line_dash="dot", line_color="#555")
-    fig_neer_wow.update_layout(**base_layout("S$NEER Week-on-Week % Change + 4W Moving Average"))
-    fig_neer_wow.update_yaxes(ticksuffix="%")
-
-    with st.spinner("Loading SORA…"):
-        sora = fetch_sora(years_back=3)
-
-    fig_sora = go.Figure()
-    s = clip(sora)
-    if not s.empty:
-        fig_sora.add_trace(go.Scatter(x=s.index, y=s["SORA"], name="SORA", line=dict(color="#90a4d4")))
-    fig_sora.update_layout(**base_layout("SORA — Singapore Overnight Rate Average"))
-    fig_sora.update_yaxes(ticksuffix="%")
-
-    with st.spinner("Loading money supply, reserves & government revenue…"):
-        m3 = fetch_singstat("M701111", "M3")
-        fx_reserves = fetch_singstat("M700031", "Official Foreign Reserves")
-        gov_revenue = fetch_singstat("M130501", "Government Operating Revenue")
-
-    # Money supply (M3) - only M3 is published as its own resourceId; MAS doesn't break out
-    # M1/M2 the same granular way FRED does for the US dashboard's M2 chart.
-    fig_m3 = go.Figure()
-    m3_c = clip(m3)
-    if not m3_c.empty:
-        fig_m3.add_trace(go.Scatter(x=m3_c.index, y=m3_c["M3"] / 1000, name="M3",
-                                    line=dict(color="#26a69a"), fill="tozeroy", fillcolor="rgba(38,166,154,0.15)"))
-    fig_m3.update_layout(**base_layout("Money Supply (M3)"))
-    fig_m3.update_yaxes(ticksuffix="B", title="S$ Billion")
-
-    # Official Foreign Reserves - Singapore has no TGA; this is MAS's own published reserves
-    # balance, the closest real analogue to a fiscal/monetary buffer metric.
-    fig_reserves = go.Figure()
-    res_c = clip(fx_reserves)
-    if not res_c.empty:
-        fig_reserves.add_trace(go.Scatter(x=res_c.index, y=res_c["Official Foreign Reserves"] / 1000,
-                                          name="Official Foreign Reserves", line=dict(color="#42a5f5"),
-                                          fill="tozeroy", fillcolor="rgba(66,165,245,0.15)"))
-    fig_reserves.update_layout(**base_layout("Official Foreign Reserves"))
-    fig_reserves.update_yaxes(ticksuffix="B", title="S$ Billion")
-
-    # Government Operating Revenue - monthly, real, and lumpy (property tax collection months
-    # spike). Revenue only, not a full receipts/outlays/deficit chart: no monthly total-
-    # expenditure series was found on SingStat, only annual.
-    fig_gov_rev = go.Figure()
-    gov_c = clip(gov_revenue)
-    if not gov_c.empty:
-        fig_gov_rev.add_trace(go.Scatter(x=gov_c.index, y=gov_c["Government Operating Revenue"],
-                                         name="Government Operating Revenue", line=dict(color="#eda100"),
-                                         fill="tozeroy", fillcolor="rgba(237,161,0,0.15)"))
-    fig_gov_rev.update_layout(**base_layout("Government Operating Revenue (Monthly)"))
-    fig_gov_rev.update_yaxes(title="S$ Million")
-
-    TENORS = {"6M": "0.5", "1Y": "1", "2Y": "2", "5Y": "5", "10Y": "10", "15Y": "15", "20Y": "20", "30Y": "30", "50Y": "50"}
-    with st.spinner("Loading SGS yields…"):
-        yc = pd.concat([fetch_sgs_yield(t, label) for label, t in TENORS.items()], axis=1)
-        yc = yc.ffill()
-
-    fig_yc = go.Figure()
-    if not yc.empty:
-        snap_labels = {"Latest": 0, "1W Ago": -5, "1M Ago": -21, "3M Ago": -63}
-        snap_colors = {"Latest": "cyan", "1W Ago": "orange", "1M Ago": "green", "3M Ago": "magenta"}
-        for label, offset in snap_labels.items():
-            idx = max(0, len(yc) - 1 + offset)
-            snap_date = yc.index[idx]
-            row_vals = yc.iloc[idx]
-            fig_yc.add_trace(go.Scatter(
-                x=list(TENORS.keys()), y=row_vals.values, mode="lines+markers",
-                name=f"{label} ({snap_date.date()})",
-                line=dict(color=snap_colors[label], width=2 if label == "Latest" else 1,
-                          dash="solid" if label == "Latest" else "dash")))
-    fig_yc.update_layout(**base_layout("SGS Yield Curve — Snapshots"))
-    fig_yc.update_yaxes(ticksuffix="%", title="Yield")
-
-    fig_yc_hist = go.Figure()
-    for label in ["2Y", "5Y", "10Y"]:
-        src = clip(yc[[label]]) if label in yc.columns else pd.DataFrame()
-        if not src.empty:
-            fig_yc_hist.add_trace(go.Scatter(x=src.index, y=src[label], name=label, mode="lines"))
-    fig_yc_hist.update_layout(**base_layout("SGS 2Y / 5Y / 10Y Yields"))
-    fig_yc_hist.update_yaxes(ticksuffix="%")
-
-    # Spreads over time - 2s5s/2s10s/5s30s are simple slope spreads, 2s5s10s is the classic
-    # butterfly (2x the belly minus both wings). All in bps, on one chart.
-    fig_spreads = go.Figure()
-    spread_curve = pd.DataFrame()
-    if all(t in yc.columns for t in ["2Y", "5Y", "10Y", "30Y"]):
-        spread_curve = yc[["2Y", "5Y", "10Y", "30Y"]].dropna()
-        spreads_sg = pd.DataFrame(index=spread_curve.index)
-        spreads_sg["2s5s"] = (spread_curve["5Y"] - spread_curve["2Y"]) * 100
-        spreads_sg["2s10s"] = (spread_curve["10Y"] - spread_curve["2Y"]) * 100
-        spreads_sg["2s5s10s"] = (2 * spread_curve["5Y"] - spread_curve["10Y"] - spread_curve["2Y"]) * 100
-        spreads_sg["5s30s"] = (spread_curve["30Y"] - spread_curve["5Y"]) * 100
-        spreads_sg = clip(spreads_sg)
-        for col, color in [("2s5s", "#42a5f5"), ("2s10s", "#26a69a"), ("2s5s10s", "#ff9800"), ("5s30s", "#ab47bc")]:
-            fig_spreads.add_trace(go.Scatter(x=spreads_sg.index, y=spreads_sg[col], name=col, mode="lines", line=dict(color=color)))
-        fig_spreads.add_hline(y=0, line_dash="dot", line_color="#555")
-    fig_spreads.update_layout(**base_layout("SGS Curve Spreads — 2s5s / 2s10s / 2s5s10s / 5s30s"))
-    fig_spreads.update_yaxes(ticksuffix=" bps")
-
-    with st.spinner("Loading SGS auction results…"):
-        auctions = load_sgs_auctions()
-
-    # Outstanding by remaining maturity (nearest-tenor ladder, same buckets as the US
-    # dashboard's version, extended 5Y apart past 30Y since SGS issues out to 50Y), stacked by
-    # bond category, with the yield curve overlaid on a secondary axis.
-    with st.spinner("Computing outstanding SGS by remaining maturity…"):
-        _, sg_outstanding_summary = get_sg_outstanding_by_remaining_maturity(auctions)
-    sg_ladder_labels = list(SG_MATURITY_LADDER.keys())
-    sg_pivot = sg_outstanding_summary.pivot_table(index="maturity_bucket", columns="category", values="amt_bil", aggfunc="sum")
-    sg_pivot = sg_pivot.reindex(sg_ladder_labels).fillna(0)
-
-    fig_sg_outstanding = go.Figure()
-    for cat in sg_pivot.columns:
-        if sg_pivot[cat].sum() > 0:
-            fig_sg_outstanding.add_trace(go.Bar(
-                x=sg_ladder_labels, y=sg_pivot[cat], name=cat,
-                marker_color=SG_CATEGORY_COLORS.get(cat, "#9e9e9e"), yaxis="y"))
-    if not yc.empty:
-        tenor_years = {label: float(code) for label, code in TENORS.items()}
-        target_years = list(SG_MATURITY_LADDER.values())
-        for label, offset in snap_labels.items():
-            idx = max(0, len(yc) - 1 + offset)
-            interp_yields = _interp_sg_yield_curve(yc.iloc[idx], tenor_years, target_years)
-            fig_sg_outstanding.add_trace(go.Scatter(
-                x=sg_ladder_labels, y=interp_yields, mode="lines+markers", name=f"Yield: {label}",
-                yaxis="y2", line=dict(color=snap_colors[label], width=2 if label == "Latest" else 1,
-                                       dash="solid" if label == "Latest" else "dash"),
-                marker=dict(size=4)))
-    total_sg_outstanding = sg_pivot.values.sum()
-    fig_sg_outstanding.update_layout(**dual_axis_layout(
-        f"Outstanding SGS & T-Bills by Remaining Maturity (S${total_sg_outstanding:,.0f}B)",
-        "Outstanding (S$ Billion)", "Yield (%)"))
-    fig_sg_outstanding.update_layout(barmode="stack", yaxis2=dict(ticksuffix="%"))
-
-    bc_type = st.selectbox("Bid-to-cover: instrument type", sorted(auctions["bill_bond_ind"].dropna().unique()), key="sg_bc_type")
-    bc_hist = auctions[(auctions["bill_bond_ind"] == bc_type) & auctions["bid_to_cover"].notna() &
-                        (auctions["auction_date"] >= START) & (auctions["auction_date"] <= END)].sort_values("auction_date").copy()
-    # One line per true original-tenor bucket (not raw auction_tenor, which fragments
-    # reopenings the same way security_term_week_year did on the US dashboard before that fix).
-    bc_hist["tenor_bucket"] = bc_hist["issue_code"].map(_sg_true_original_tenor_bucket(auctions))
-    fig_btc = go.Figure()
-    for term in sorted(bc_hist["tenor_bucket"].dropna().unique(), key=lambda t: _SG_LADDER_ORDER.get(t, 999)):
-        term_df = bc_hist[bc_hist["tenor_bucket"] == term]
-        fig_btc.add_trace(go.Scatter(x=term_df["auction_date"], y=term_df["bid_to_cover"],
-                                      mode="lines+markers", name=term, marker=dict(size=4)))
-    fig_btc.update_layout(**base_layout(f"Bid-to-Cover Ratio — {bc_type.title()}s"))
-
-    # Net issuance - recently issued (past Nd) vs upcoming maturities (next Nd), both real
-    # settled amounts (see get_sg_net_issuance for why this is trailing rather than forward
-    # like the US "Issuance vs Maturity" chart).
-    net_issuance_days = st.select_slider("Net Issuance window (days)", options=[30, 60, 90, 180], value=90, key="sg_net_issuance_days")
-    with st.spinner("Computing net issuance…"):
-        net_issuance_df = get_sg_net_issuance(auctions, net_issuance_days)
-    fig_net_issuance = go.Figure()
-    if not net_issuance_df.empty:
-        fig_net_issuance.add_trace(go.Bar(x=net_issuance_df["tenor_bucket"], y=net_issuance_df["Issuance"],
-                                           name="Issued", marker_color="#26a69a"))
-        fig_net_issuance.add_trace(go.Bar(x=net_issuance_df["tenor_bucket"], y=-net_issuance_df["Maturing"],
-                                           name="Maturing", marker_color="#ef5350"))
-        fig_net_issuance.add_trace(go.Scatter(x=net_issuance_df["tenor_bucket"], y=net_issuance_df["Net"],
-                                               name="Net Issuance", mode="lines+markers", line=dict(color="#90a4d4", width=2)))
-    total_net = net_issuance_df["Net"].sum() if not net_issuance_df.empty else 0
-    fig_net_issuance.update_layout(**base_layout(
-        f"Net Issuance by Original Tenor — Issued (past {net_issuance_days}d) vs Maturing (next {net_issuance_days}d), Net: S${total_net:,.1f}B"))
-    fig_net_issuance.update_layout(barmode="relative")
-
-    render_two_col([
-        ("SGD NEER", fig_neer, n),
-        ("SGD NEER WoW Change", fig_neer_wow, neer_wow),
-        ("SORA", fig_sora, s),
-        ("SGS Yield Curve Snapshots", fig_yc, yc.tail(1)),
-        ("SGS 2Y/5Y/10Y Yields", fig_yc_hist, clip(yc[["2Y", "5Y", "10Y"]]) if not yc.empty else pd.DataFrame()),
-        ("SGS Curve Spreads", fig_spreads, spread_curve),
-        ("Outstanding SGS by Remaining Maturity", fig_sg_outstanding, sg_pivot.reset_index()),
-        ("Net Issuance", fig_net_issuance, net_issuance_df),
-        ("Bid-to-Cover Trend", fig_btc, bc_hist[["auction_date", "issue_code", "tenor_bucket", "bid_to_cover"]]),
-        ("Money Supply (M3)", fig_m3, m3_c),
-        ("Official Foreign Reserves", fig_reserves, res_c),
-        ("Government Operating Revenue", fig_gov_rev, gov_c),
-    ])
-
-    st.markdown('<div class="section-header">Upcoming SGS / T-Bill Issuance</div>', unsafe_allow_html=True)
-    st.caption("Unlike the US Treasury calendar, MAS does not publish the offering size at announcement — "
-               "auction size is only disclosed once that auction has closed, so this table shows tenor and "
-               "dates only.")
-    with st.spinner("Loading issuance calendar…"):
-        cal = load_sgs_issuance_calendar()
-    days_ahead_bonds = st.select_slider("Forward-looking window (days)", options=[30, 60, 90, 180], value=90, key="sg_issuance_days")
-    today = pd.Timestamp.today().normalize()
-    cutoff = today + pd.Timedelta(days=days_ahead_bonds)
-    upcoming_cal = cal[(cal["auction_date"] >= today) & (cal["auction_date"] <= cutoff)].sort_values("auction_date")
-    fig_cal = go.Figure(go.Table(
-        header=dict(values=["Auction Date", "Issue Date", "Issue Code", "Tenor", "Type"],
-                    fill_color=PLOT_BG, font=dict(color="white", size=12), align="center", height=28),
-        cells=dict(values=[upcoming_cal["auction_date"].dt.strftime("%Y-%m-%d"), upcoming_cal["issue_date"].dt.strftime("%Y-%m-%d"),
-                            upcoming_cal["issue_code"], upcoming_cal["auction_tenor_formatted"], upcoming_cal["agency_custom_categories"]],
-                   fill_color=PAPER_BG, font=dict(color="#e0e0e0", size=11), align="center")
-    ))
-    fig_cal.update_layout(**base_layout(f"Upcoming SGS/T-Bill Auctions — Next {days_ahead_bonds}d", height=420))
-    st.plotly_chart(fig_cal, use_container_width=True)
-    csv_download(upcoming_cal, "sgs_upcoming_issuance")
-
-# ════════════════════════════════════════════════════════════════════════════════
-# TAB 5 — Dividends
-# ════════════════════════════════════════════════════════════════════════════════
-with tabs[4]:
+with tabs[7]:
     st.header("Dividends")
     st.caption("Dividend seasonality for a 20-stock basket of SGX blue chips and major S-REITs — a different "
                "data domain from the rest of this dashboard (equities/corporate actions via yfinance, not "
@@ -1419,15 +2471,36 @@ with tabs[4]:
     csv_download(universe_df, "sg_dividend_universe")
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 6 — Economic Calendar
+# TAB 9 — Economic Calendar
 # ════════════════════════════════════════════════════════════════════════════════
-with tabs[5]:
+with tabs[8]:
     st.header("Economic Calendar")
-    st.caption("Monetary Policy Statement dates (MAS reviews the S\\$NEER policy band quarterly, not an interest "
-               "rate) + upcoming SGS/T-Bill auctions. No SingStat release-date-schedule API was confirmed "
-               "(unlike FRED's release/dates endpoint for the US dashboard), so this doesn't include a "
-               "forward CPI/GDP release calendar — only auctions and MPS dates, which are pre-scheduled.")
+    st.caption("Live Investing.com economic calendar widget (same source as the US dashboard), times in GMT+8 "
+               "(Singapore). Scrollable and date-navigable inside the widget itself.")
 
+    # Investing.com country ids (verified live 2026-09-30 in the widget itself): 36 = Singapore,
+    # 5 = United States, 37 = China. timeZone=113 = "(GMT +8:00) Singapore" (see usa_macro.py).
+    # Investing.com tags almost every SG release as low importance, so a medium/high filter like
+    # the US widget uses returns zero SGD rows - the SG-only view therefore shows all importance
+    # levels, while the "SGD drivers" view adds US/China at medium/high only to avoid flooding.
+    cal_view = st.radio("View", ["Singapore — all releases", "SGD drivers — SG + US + China (medium/high)"],
+                        horizontal=True, key="sg_investing_view")
+    countries, importance = ("36", "1,2,3") if cal_view.startswith("Singapore") else ("36,5,37", "2,3")
+    INVESTING_CALENDAR_SRC = ("https://sslecal2.investing.com?"
+        "columns=exc_flags,exc_currency,exc_importance,exc_actual,exc_forecast,exc_previous"
+        f"&importance={importance}&features=datepicker,timezone&countries={countries}&calType=week&timeZone=113&lang=1")
+    components.html(f"""
+        <iframe src="{INVESTING_CALENDAR_SRC}" width="100%" height="700" frameborder="0"
+                allowtransparency="true" marginwidth="0" marginheight="0"></iframe>
+        <div style="font-family: Arial, Helvetica, sans-serif; text-align:right; margin-top:4px;">
+            <span style="font-size: 11px; color: #888;">Real Time Economic Calendar provided by
+            <a href="https://www.investing.com/" rel="nofollow" target="_blank"
+               style="color:#06529D; font-weight:bold;">Investing.com</a>.</span>
+        </div>
+    """, height=740, scrolling=True)
+
+    st.markdown('<div class="section-header">MAS Policy Statements & SGS Auctions (not covered by Investing.com)</div>',
+                unsafe_allow_html=True)
     days_ahead = st.select_slider("Forward-looking window (days)", options=[30, 60, 90, 180], value=90, key="sg_econ_cal_days")
     today = pd.Timestamp.today().normalize()
     cutoff = today + pd.Timedelta(days=days_ahead)
@@ -1466,10 +2539,35 @@ with tabs[5]:
     else:
         st.info(f"No tracked MPS dates or SGS auctions in the next {days_ahead} days.")
 
-    st.markdown('<div class="section-header">MPS History</div>', unsafe_allow_html=True)
-    hist_df = pd.DataFrame({"Date": [d.strftime("%Y-%m-%d") for d in mps_dates]}).sort_values("Date", ascending=False)
-    st.dataframe(hist_df, use_container_width=True, hide_index=True, height=250)
+    st.markdown('<div class="section-header">MPS History — Market Reaction & Realised S&#36;NEER Path</div>', unsafe_allow_html=True)
+    def _day_move(s_, d, mult):
+        s_ = s_.dropna()
+        if s_.empty or d > s_.index[-1]:
+            return np.nan
+        before, after = s_.asof(d - pd.Timedelta(days=1)), s_[s_.index >= d]
+        return (after.iloc[0] - before) * mult if (pd.notna(before) and not after.empty) else np.nan
+    hist_rows = []
+    sorted_mps = sorted(mps_dates)
+    for i, d in enumerate(sorted_mps):
+        nxt = sorted_mps[i + 1] if i + 1 < len(sorted_mps) else (neer_daily.index[-1] if not neer_daily.empty else d)
+        n0, n1 = (neer_daily.asof(d), neer_daily.asof(nxt)) if not neer_daily.empty else (np.nan, np.nan)
+        yrs = max((nxt - d).days, 1) / 365.25
+        hist_rows.append({
+            "MPS Date": d.strftime("%Y-%m-%d"),
+            "USD/SGD Δ on day (%)": _day_move(usdsgd, d, 1) / usdsgd.asof(d) * 100 if not usdsgd.empty else np.nan,
+            "2Y SGS Δ (bps)": _day_move(y2, d, 100), "10Y SGS Δ (bps)": _day_move(y10, d, 100),
+            "S$NEER Δ to next MPS (% ann.)": ((n1 / n0) ** (1 / yrs) - 1) * 100 if pd.notna(n0) and pd.notna(n1) and n0 else np.nan,
+        })
+    hist_df = pd.DataFrame(hist_rows).iloc[::-1]
+    st.dataframe(hist_df.style.format({c: "{:+.2f}" for c in hist_df.columns if c != "MPS Date"}, na_rep="—")
+                 .map(_chgcolor, subset=[c for c in hist_df.columns if c != "MPS Date"]),
+                 use_container_width=True, hide_index=True, height=400)
+    st.caption("Day moves compare the first close on/after the MPS date with the prior close (MPS is released "
+               "before the SG open, so this captures the reaction). \"S\\$NEER Δ to next MPS\" is the realised "
+               "annualised appreciation until the following statement - a rough read of the slope MAS actually "
+               "delivered in that window (uses the daily model where available, else the weekly MAS index).")
+    csv_download(hist_df, "sg_mps_history")
 
 st.markdown("---")
-st.caption("Data: SingStat Table Builder · MAS Bonds & Bills / Domestic Interest Rates · Refresh rate: 6hr cache "
-           "(SORA/yields/auctions), 1hr (summary metrics), 24hr (outstanding SGS), 7d (MPS dates)")
+st.caption("Data: SingStat Table Builder · MAS (S\\$NEER, SORA, SGS benchmarks, bonds & bills) · US Treasury · "
+           "NY Fed (SOFR) · yfinance (FX, dividends). Cache: 1hr FX & summary, 6hr MAS/SingStat/UST, 7d MPS dates & S\\$NEER.")
