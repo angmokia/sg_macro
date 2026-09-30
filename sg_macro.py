@@ -1607,6 +1607,27 @@ with tabs[1]:
         st.caption("Changes in bps. Percentile = where today's level sits in its own trailing 1Y / 5Y range.")
         csv_download(rm_df, "sg_rates_monitor")
 
+    # SORA curve snapshots - same snapshot treatment as the SGS curve below (Latest/1D/1W/1M/3M
+    # Ago), but across the SORA family's own tenor points: overnight SORA plus 1M/3M/6M
+    # compounded SORA. That's the complete set MAS publishes here - there's no SORA equivalent
+    # of SGS's 2Y-50Y benchmarks, so this curve only runs out to 6M.
+    sora_curve = pd.concat([sora.rename("O/N"), csora1.rename("1M"), csora3.rename("3M"), csora6.rename("6M")], axis=1)
+    sora_tenors = [t for t in sora_curve.columns if sora_curve[t].iloc[-60:].notna().any()] if not sora_curve.empty else []
+    sora_curve_live = sora_curve[sora_tenors].dropna(how="all").ffill(limit=3) if sora_tenors else pd.DataFrame()
+    fig_sora_curve = go.Figure()
+    sora_snap_rows = {}
+    if not sora_curve_live.empty:
+        snaps_ = {"Latest": 0, "1D Ago": -1, "1W Ago": -5, "1M Ago": -21, "3M Ago": -63}
+        colors_s = {"Latest": "cyan", "1D Ago": "magenta", "1W Ago": "orange", "1M Ago": "green", "3M Ago": "#90a4d4"}
+        for lab, off in snaps_.items():
+            row = sora_curve_live.iloc[max(0, len(sora_curve_live) - 1 + off)]
+            sora_snap_rows[f"{lab} ({row.name:%Y-%m-%d})"] = row
+            fig_sora_curve.add_trace(go.Scatter(x=sora_tenors, y=row.values, mode="lines+markers", name=f"{lab} ({row.name:%d %b})",
+                                                line=dict(color=colors_s[lab], width=2 if lab == "Latest" else 1,
+                                                          dash="solid" if lab == "Latest" else "dash")))
+    fig_sora_curve.update_layout(**base_layout("SORA Curve — Snapshots"))
+    fig_sora_curve.update_yaxes(ticksuffix="%")
+
     # Curve snapshots & changes
     live_tenors = [t for t in sgs.columns if sgs[t].iloc[-60:].notna().any()] if not sgs.empty else []
     curve = sgs[live_tenors].dropna(how="all").ffill(limit=3) if live_tenors else pd.DataFrame()
@@ -1728,6 +1749,7 @@ with tabs[1]:
     fig_real.update_yaxes(ticksuffix="%")
 
     render_two_col([
+        ("SORA Curve Snapshots", fig_sora_curve, pd.DataFrame(sora_snap_rows).T if sora_snap_rows else None),
         ("SGS Yield Curve Snapshots", fig_yc, pd.DataFrame(snap_rows).T if snap_rows else None),
         ("SGS Curve Changes", fig_yc_chg, None),
         ("SGS Benchmark Yields", fig_yields, clip(sgs)),
