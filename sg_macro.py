@@ -1669,19 +1669,26 @@ with tabs[1]:
         rows_ = []
         for t in roll_tenors:
             yT = float(last_curve[t])
-            carry = (yT - fund) * 100 * 0.25
+            T_ = SGS_TENOR_YEARS[t]
+            # Carry is a price return ((yield - funding) x 3/12, bp of notional); roll and vol are in bp of
+            # YIELD. Divide by modified duration (par bond, semi-annual coupons) so all three share a unit -
+            # without this, long-end carry was overstated by roughly its duration and the ranking inverted.
+            dur = (1 - (1 + yT / 200) ** (-2 * T_)) / (yT / 100)
+            carry_px = (yT - fund) * 100 * 0.25
+            carry = carry_px / dur
             roll = float(curve_interp(last_curve, [SGS_TENOR_YEARS[t]])[0] - curve_interp(last_curve, [SGS_TENOR_YEARS[t] - 0.25])[0]) * 100
             vol = sgs[t].dropna().diff().iloc[-63:].std() * 100 * np.sqrt(63)
-            rows_.append({"Tenor": t, "Yield %": yT, "Carry (bps, 3M)": carry, "Roll (bps, 3M)": roll,
+            rows_.append({"Tenor": t, "Yield %": yT, "Mod. duration": dur, "Carry (bps price, 3M)": carry_px,
+                          "Carry (bps yield, 3M)": carry, "Roll (bps, 3M)": roll,
                           "Carry+Roll (bps)": carry + roll, "3M yield vol (bps)": vol,
                           "Breakeven ratio": (carry + roll) / vol if vol else np.nan})
         cr_df = pd.DataFrame(rows_)
-        fig_cr.add_trace(go.Bar(x=cr_df["Tenor"], y=cr_df["Carry (bps, 3M)"], name="Carry", marker_color="#42a5f5"))
+        fig_cr.add_trace(go.Bar(x=cr_df["Tenor"], y=cr_df["Carry (bps yield, 3M)"], name="Carry (bp yield)", marker_color="#42a5f5"))
         fig_cr.add_trace(go.Bar(x=cr_df["Tenor"], y=cr_df["Roll (bps, 3M)"], name="Roll", marker_color="#26a69a"))
         fig_cr.add_trace(go.Scatter(x=cr_df["Tenor"], y=cr_df["Breakeven ratio"], name="(Carry+Roll) / 3M vol",
                                     yaxis="y2", mode="lines+markers", line=dict(color="#ff9800", width=2)))
         fig_cr.update_layout(**dual_axis_layout(f"SGS Carry + Roll, 3M Horizon (funded at 3M Comp. SORA {fund:.2f}%)",
-                                                "bps", "Carry+Roll / Vol"), barmode="relative")
+                                                "bps of yield", "Carry+Roll / Vol"), barmode="relative")
 
     fig_vs_ust = go.Figure()
     zline(fig_vs_ust, sgs_ust_2, "2Y SGS − UST", color="#42a5f5", unit=" bps", fmt=".0f")
@@ -1734,7 +1741,8 @@ with tabs[1]:
     if not cr_df.empty:
         st.dataframe(cr_df.style.format({c: "{:.2f}" for c in cr_df.columns if c != "Tenor"}),
                      hide_index=True, use_container_width=True)
-        st.caption("Carry = (yield − 3M compounded SORA) × 3/12; roll = yield pickup from rolling 3 months down "
+        st.caption("All in bps of yield over 3 months. Carry = (yield − 3M compounded SORA) × 3/12, divided by modified "
+                   "duration to turn that price return into the yield rise it offsets; roll = yield pickup from rolling 3 months down "
                    "today's curve; breakeven ratio = (carry + roll) / 3M realized yield vol - how many standard "
                    "deviations of adverse move the position can absorb over 3 months. Compounded SORA is "
                    "backward-looking, so this is a funding proxy rather than a traded term rate.")
