@@ -1574,38 +1574,134 @@ with tabs[1]:
                "SOFR from the NY Fed. Hover any line for that day's trailing 1Y z-score. MAS no longer quotes a 3M or "
                "7Y benchmark, so the curve runs 6M → 50Y.")
 
-    # Rates monitor
-    st.markdown('<div class="section-header">Rates Monitor</div>', unsafe_allow_html=True)
-    rm_items = [("SORA", sora, "%"), ("3M Comp. SORA", csora3, "%"), ("6M T-Bill", bill6, "%"), ("1Y T-Bill", bill12, "%")]
-    rm_items += [(f"{t} SGS", _col(sgs, t), "%") for t in ("2Y", "5Y", "10Y", "15Y", "20Y", "30Y", "50Y")]
-    rm_items += [(k, v, "bps") for k, v in SPREADS.items()]
-    rm_items += [("2Y SGS − UST", sgs_ust_2, "bps"), ("10Y SGS − UST", sgs_ust_10, "bps"), ("SORA − SOFR", sora_sofr, "bps")]
-    rm_rows = []
-    for name, s_, unit in rm_items:
-        s_ = s_.dropna()
-        if len(s_) < 30:
-            continue
-        m_ = 100 if unit == "%" else 1
-        z_ = _zscores(s_, Z_WINDOWS["D"])
-        rm_rows.append({
-            "Instrument": name, "Last": f"{s_.iloc[-1]:.3f}%" if unit == "%" else f"{s_.iloc[-1]:+.1f}bp",
-            "Δ1D": (s_.iloc[-1] - s_.iloc[-2]) * m_, "Δ1W": _change_over(s_, pd.Timedelta(days=7)) * m_,
-            "Δ1M": _change_over(s_, pd.DateOffset(months=1)) * m_, "Δ3M": _change_over(s_, pd.DateOffset(months=3)) * m_,
-            "Z 1M": z_["1M"], "Z 3M": z_["3M"], "Z 1Y": z_["1Y"],
-            "1Y %ile": _pctile(s_, 1), "5Y %ile": _pctile(s_, 5), "As of": s_.index[-1].strftime("%d %b"),
-        })
-    rm_df = pd.DataFrame(rm_rows)
-    if not rm_df.empty:
-        chg_cols = ["Δ1D", "Δ1W", "Δ1M", "Δ3M"]
-        sty = (rm_df.style
-               .format({**{c: "{:+.1f}" for c in chg_cols}, "Z 1M": "{:+.2f}", "Z 3M": "{:+.2f}", "Z 1Y": "{:+.2f}",
-                        "1Y %ile": "{:.0f}", "5Y %ile": "{:.0f}"}, na_rep="—")
-               .map(_chgcolor, subset=chg_cols)
-               .map(_zcolor, subset=["Z 1M", "Z 3M", "Z 1Y"])
-               .map(_pctcolor, subset=["1Y %ile", "5Y %ile"]))
-        st.dataframe(sty, hide_index=True, use_container_width=True, height=36 * (len(rm_df) + 1))
-        st.caption("Changes in bps. Percentile = where today's level sits in its own trailing 1Y / 5Y range.")
-        csv_download(rm_df, "sg_rates_monitor")
+    # Tenors MAS still quotes (3M/7Y went blank), and the curve built from them - used by the monitor
+    # and the snapshot / rolldown / carry charts below.
+    live_tenors = [t for t in sgs.columns if sgs[t].iloc[-60:].notna().any()] if not sgs.empty else []
+    curve = sgs[live_tenors].dropna(how="all").ffill(limit=3) if live_tenors else pd.DataFrame()
+
+    # Rates monitor: one collapsible panel holding three collapsible tables (outrights / spreads / flies),
+    # same layout and carry conventions as usa_macro.py's monitor. Funding = 3M compounded SORA, matching
+    # the carry + roll chart below. MAS no longer quotes 3M or 7Y, so 6M stands in for the US 3M legs.
+    SG_RM_SPREADS = {   # spread = Σ weight × yield (bp); "long" = steepener (pay the positive-weight leg)
+        "2s5s": {"5Y": 1, "2Y": -1}, "2s10s": {"10Y": 1, "2Y": -1}, "5s10s": {"10Y": 1, "5Y": -1},
+        "5s30s": {"30Y": 1, "5Y": -1}, "10s30s": {"30Y": 1, "10Y": -1}, "6M10Y": {"10Y": 1, "6M": -1},
+        "10s20s": {"20Y": 1, "10Y": -1}, "2s30s": {"30Y": 1, "2Y": -1}, "30s50s": {"50Y": 1, "30Y": -1},
+    }
+    SG_RM_FLIES = {     # long fly = pay the belly (positive weight), receive the wings
+        "2s5s10s": {"5Y": 2, "2Y": -1, "10Y": -1}, "5s10s30s": {"10Y": 2, "5Y": -1, "30Y": -1},
+        "10s20s30s": {"20Y": 2, "10Y": -1, "30Y": -1}, "1s10s20s": {"10Y": 2, "1Y": -1, "20Y": -1},
+        "2s10s30s": {"10Y": 2, "2Y": -1, "30Y": -1}, "10s15s20s": {"15Y": 2, "10Y": -1, "20Y": -1},
+        "20s30s50s": {"30Y": 2, "20Y": -1, "50Y": -1},
+    }
+
+    def build_sg_rates_monitor():
+        fund_s = csora3.dropna()
+        fund, fund_dt = float(fund_s.iloc[-1]), fund_s.index[-1]
+        last = curve.iloc[-1].dropna()
+        legs = {}
+        for t in live_tenors:
+            if t not in last:
+                continue
+            y_, T_ = float(last[t]), SGS_TENOR_YEARS[t]
+            dur = (1 - (1 + y_ / 200) ** (-2 * T_)) / (y_ / 100)       # modified duration, par bond, semi-annual
+            running = (y_ - fund) * 100                                # bp/yr, receiving the tenor, funded at 3M comp. SORA
+            # ≤1Y matures inside the 1Y horizon: no yield risk to break even against, and rolling to "0Y" would
+            # just land on the shortest quote, so breakeven carry & roll are left blank
+            be = running / dur if T_ > 1 else np.nan
+            roll = float(curve_interp(last, [T_])[0] - curve_interp(last, [T_ - 1])[0]) * 100 if T_ > 1 else np.nan
+            legs[t] = (running, be, roll)
+
+        def row(name, s_, unit, running=np.nan, be=np.nan, roll=np.nan):
+            s_ = s_.dropna()
+            if len(s_) < 30:
+                return None
+            m_ = 100 if unit == "%" else 1
+            z_ = _zscores(s_, Z_WINDOWS["D"])
+            vol = s_.diff().iloc[-252:].std() * m_ * np.sqrt(252)
+            cr = be + roll
+            return {"Instrument": name, "Level": float(s_.iloc[-1]), "_unit": unit,
+                    "Δ1D (bp)": (s_.iloc[-1] - s_.iloc[-2]) * m_, "Δ1W (bp)": _change_over(s_, pd.Timedelta(days=7)) * m_,
+                    "Δ1M (bp)": _change_over(s_, pd.DateOffset(months=1)) * m_, "Δ3M (bp)": _change_over(s_, pd.DateOffset(months=3)) * m_,
+                    "Z 1M": z_["1M"], "Z 3M": z_["3M"], "Z 1Y": z_["1Y"], "1Y %ile": _pctile(s_, 1), "5Y %ile": _pctile(s_, 5),
+                    "Carry (bp/yr)": running, "Breakeven carry (bp yld/yr)": be, "Roll 1Y (bp)": roll,
+                    "Carry+Roll (bp yld/yr)": cr, "1Y vol (bp)": vol,
+                    "C+R / Vol": cr / vol if pd.notna(cr) and vol else np.nan, "As of": s_.index[-1]}
+
+        outr = [row("SORA", sora, "%"), row("1M Comp. SORA", csora1, "%"), row("3M Comp. SORA", csora3, "%"),
+                row("6M Comp. SORA", csora6, "%")]
+        outr += [row(f"{t} {'T-Bill' if SGS_TENOR_YEARS[t] <= 1 else 'SGS'}", _col(sgs, t), "%", *legs[t])
+                 for t in live_tenors if t in legs]
+
+        def combo(defs):
+            out = []
+            for n, w in defs.items():
+                if not all(k in legs for k in w):
+                    continue
+                s_ = (sum(_col(sgs, k) * v for k, v in w.items()) * 100).dropna()
+                be = -sum(v * legs[k][1] for k, v in w.items())       # DV01-neutral legs add in bp of yield
+                roll = -sum(v * legs[k][2] for k, v in w.items())
+                out.append(row(n, s_, "bp", np.nan, be, roll))
+            return out
+        spr = combo(SG_RM_SPREADS) + [row("SORA − SOFR", sora_sofr, "bp"), row("6M T-Bill − 6M Comp. SORA", _spread(bill6, csora6), "bp"),
+                                      row("2Y SGS − UST", sgs_ust_2, "bp"), row("10Y SGS − UST", sgs_ust_10, "bp")]
+        fly = combo(SG_RM_FLIES)
+        clean = lambda rows: pd.DataFrame([r for r in rows if r is not None])
+        return clean(outr), clean(spr), clean(fly), fund, fund_dt
+
+    def render_sg_monitor_table(df, key, show_running):
+        if df.empty:
+            st.info("No data available for this table right now.")
+            return
+        if not show_running:
+            df = df.drop(columns="Carry (bp/yr)")
+        sortable = [c for c in df.columns if not c.startswith("_")]
+        s1, s2 = st.columns([3, 2])
+        sort_cols = s1.multiselect("Sort by (priority order — first pick sorts first)", sortable, default=[],
+                                   key=f"sg_rm_sort_{key}", placeholder="Default order")
+        asc = []
+        if sort_cols:
+            for dc, col in zip(s2.columns(len(sort_cols)), sort_cols):
+                asc.append(dc.radio(col, ["↓ Desc", "↑ Asc"], key=f"sg_rm_dir_{key}_{col}") == "↑ Asc")
+            df = df.sort_values(sort_cols, ascending=asc, na_position="last", kind="mergesort")
+        else:
+            s2.caption("Pick one or more columns to sort by, or click a column header for a quick single-column sort.")
+        view = df.copy()
+        view["Level"] = [f"{v:.3f}%" if u == "%" else f"{v:+.1f}bp" for v, u in zip(view["Level"], view["_unit"])]
+        view["As of"] = view["As of"].dt.strftime("%d %b")
+        view = view.drop(columns="_unit")
+        chg = ["Δ1D (bp)", "Δ1W (bp)", "Δ1M (bp)", "Δ3M (bp)"]
+        carry = [c for c in ["Carry (bp/yr)", "Breakeven carry (bp yld/yr)", "Roll 1Y (bp)", "Carry+Roll (bp yld/yr)"] if c in view]
+        # callables rather than format strings + na_rep: st.dataframe renders a Styler's NaNs as "None" otherwise
+        fmt = lambda f: (lambda v: "—" if v is None or pd.isna(v) else format(v, f))
+        st.dataframe(view.style.format({**{c: fmt("+.1f") for c in chg + carry}, "Z 1M": fmt("+.2f"), "Z 3M": fmt("+.2f"),
+                                        "Z 1Y": fmt("+.2f"), "1Y %ile": fmt(".0f"), "5Y %ile": fmt(".0f"), "1Y vol (bp)": fmt(".0f"),
+                                        "C+R / Vol": fmt("+.2f")})
+                     .map(_chgcolor, subset=chg + carry).map(_zcolor, subset=["Z 1M", "Z 3M", "Z 1Y", "C+R / Vol"])
+                     .map(_pctcolor, subset=["1Y %ile", "5Y %ile"]),
+                     hide_index=True, use_container_width=True, height=36 * (len(view) + 1))
+        csv_download(df.drop(columns="_unit"), f"sg_rates_monitor_{key}")
+
+    with st.expander("Rates Monitor — outrights, spreads & flies", expanded=True):
+        try:
+            rm_out, rm_spr, rm_fly, rm_fund, rm_fund_dt = build_sg_rates_monitor()
+        except Exception as e:
+            st.warning(f"Could not build the rates monitor: {e}")
+            rm_out = None
+        if rm_out is not None:
+            st.caption(f"Carry is for receiving each tenor funded at 3M compounded SORA ({rm_fund:.2f}%, {rm_fund_dt:%d %b}). "
+                       "Carry (bp/yr) = (yield − funding) × 100, annualised running carry. Breakeven carry = that ÷ modified "
+                       "duration (the yield rise one year of carry offsets). Roll 1Y = rolldown on today's curve. "
+                       "C+R / Vol = (breakeven carry + roll) ÷ 1Y realised vol. Tenors of 1Y and under (and flies using them) "
+                       "are blank there, since they mature inside the 1Y horizon. Spreads & flies are DV01-neutral and shown "
+                       "for being LONG the spread (steepener / long fly, i.e. paying the positive-weight legs); the SORA, bill "
+                       "and SGS−UST spreads have no carry figures. Changes in bps; percentile = where today's level sits in "
+                       "its own trailing 1Y / 5Y range.")
+            with st.expander("Outright Rates", expanded=True):
+                render_sg_monitor_table(rm_out, "outright", show_running=True)
+            with st.expander("Spreads", expanded=True):
+                render_sg_monitor_table(rm_spr, "spreads", show_running=False)
+            with st.expander("Flies", expanded=True):
+                render_sg_monitor_table(rm_fly, "flies", show_running=False)
 
     # SORA curve snapshots - same snapshot treatment as the SGS curve below (Latest/1D/1W/1M/3M
     # Ago), but across the SORA family's own tenor points: overnight SORA plus 1M/3M/6M
@@ -1629,8 +1725,6 @@ with tabs[1]:
     fig_sora_curve.update_yaxes(ticksuffix="%")
 
     # Curve snapshots & changes
-    live_tenors = [t for t in sgs.columns if sgs[t].iloc[-60:].notna().any()] if not sgs.empty else []
-    curve = sgs[live_tenors].dropna(how="all").ffill(limit=3) if live_tenors else pd.DataFrame()
     fig_yc = go.Figure()
     fig_yc_chg = go.Figure()
     snap_rows = {}
