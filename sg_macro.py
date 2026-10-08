@@ -1882,7 +1882,22 @@ with tabs[2]:
     zline(fig_ss, sora, "SORA", color="#90a4d4", unit="%")
     zline(fig_ss, sofr, "SOFR", color="#ef5350", unit="%")
     zline(fig_ss, sora_sofr, "SORA − SOFR (bps)", color="#ff9800", unit=" bps", fmt=".0f", yaxis="y2", dash="dot")
-    fig_ss.update_layout(**dual_axis_layout("SORA vs SOFR & Spread", "Rate (%)", "Spread (bps)"))
+    # USD/SGD on a third axis: the SORA−SOFR gap is the carry a USD/SGD long earns, so the two are read together
+    zline(fig_ss, usdsgd, "USD/SGD", color="#26a69a", fmt=".4f", yaxis="y3", width=1.4)
+    fig_ss.update_layout(**dual_axis_layout("SORA vs SOFR & Spread vs USD/SGD", "Rate (%)", "Spread (bps)"))
+    fig_ss.update_layout(
+        xaxis=dict(domain=[0, 0.86], gridcolor=GRID_COLOR),
+        yaxis3=dict(title=dict(text="USD/SGD", font=dict(color="#26a69a")), tickfont=dict(color="#26a69a"),
+                    overlaying="y", side="right", anchor="free", position=0.97, showgrid=False, tickformat=".3f"))
+    ss_corr_txt = ""
+    if not sora_sofr.empty and not usdsgd.empty:
+        _wk = pd.concat([sora_sofr, usdsgd], axis=1, keys=["spr", "fx"]).resample("W-FRI").last().dropna()
+        _wk = _wk[_wk.index >= _wk.index[-1] - pd.DateOffset(years=1)]
+        _c = _wk["spr"].diff().corr(np.log(_wk["fx"]).diff())
+        _how = ("SORA−SOFR rising (the negative gap narrowing) has tended to come with USD/SGD rising" if _c > 0 else
+                "SORA−SOFR falling (the gap widening, more carry for long USD/SGD) has tended to come with USD/SGD rising")
+        _strength = "weak" if abs(_c) < 0.3 else "moderate" if abs(_c) < 0.6 else "strong"
+        ss_corr_txt = (f"1Y correlation of weekly changes, SORA−SOFR vs USD/SGD: {_c:+.2f} ({_strength}) - {_how}.")
 
     fig_bill_ois = go.Figure()
     bill_ois = _spread(bill6, csora6)
@@ -1940,9 +1955,14 @@ with tabs[2]:
         fig_gov_rev.add_trace(go.Scatter(x=r12.index, y=r12.values, name="12M avg", line=dict(color="#eda100", width=2)))
     fig_gov_rev.update_layout(**base_layout("Government Operating Revenue (S$M, monthly + 12M avg)"))
 
+    # Full width: four series on three axes is unreadable at half width
+    fig_ss.update_layout(height=520, xaxis=dict(domain=[0, 0.9], gridcolor=GRID_COLOR))
+    st.plotly_chart(fig_ss, use_container_width=True, key="chart_SORA vs SOFR")
+    if ss_corr_txt:
+        st.caption(ss_corr_txt)
+    csv_download(clip(pd.concat([sora_sofr.rename("SORA-SOFR bps"), usdsgd.rename("USD/SGD")], axis=1).dropna(how="all")), "SORA vs SOFR")
     render_two_col([
         ("SGD Money Markets", fig_mm, clip(sora_all)),
-        ("SORA vs SOFR", fig_ss, clip(sora_sofr.to_frame("SORA-SOFR bps"))),
         ("Bill vs Comp SORA", fig_bill_ois, clip(bill_ois.to_frame("bps"))),
         ("SORA Volume", fig_sora_vol, sv),
         ("Money Supply Growth", fig_ms, clip(ms_yoy)),
