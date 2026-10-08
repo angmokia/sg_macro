@@ -1247,6 +1247,10 @@ st.caption("Z-scores: daily series use 1M/3M/1Y trailing windows, monthly 3M/12M
 st.markdown("<br>", unsafe_allow_html=True)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
+def _mdur(y, T):
+    """Modified duration of a par bond (semi-annual coupons) with T years left; 0 once it has matured."""
+    return 0.0 if T <= 0 else (1 - (1 + y / 200) ** (-2 * T)) / (y / 100)
+
 tabs = st.tabs([
     "SGD & MAS Policy",
     "SGS & Rates",
@@ -1598,18 +1602,25 @@ with tabs[1]:
         fund_s = csora3.dropna()
         fund, fund_dt = float(fund_s.iloc[-1]), fund_s.index[-1]
         last = curve.iloc[-1].dropna()
+        # Everything in bp of yield per unit of TODAY's DV01, so DV01-neutral spread/fly legs simply add:
+        #   breakeven carry = (yield − funding) / D(T);  roll = [y(T) − y(T−1)] × D(T−1) / D(T)
+        # Roll uses the duration the bond will have a year from now (valuing it at today's duration overstated
+        # short legs - a 2Y's roll by ~2x). A 1Y held a year matures at par: all its excess return is carry, roll 0.
+        # Tenors under 1Y mature before the horizon (result depends on reinvestment), so they stay blank.
         legs = {}
         for t in live_tenors:
             if t not in last:
                 continue
             y_, T_ = float(last[t]), SGS_TENOR_YEARS[t]
-            dur = (1 - (1 + y_ / 200) ** (-2 * T_)) / (y_ / 100)       # modified duration, par bond, semi-annual
-            running = (y_ - fund) * 100                                # bp/yr, receiving the tenor, funded at 3M comp. SORA
-            # ≤1Y matures inside the 1Y horizon: no yield risk to break even against, and rolling to "0Y" would
-            # just land on the shortest quote, so breakeven carry & roll are left blank
-            be = running / dur if T_ > 1 else np.nan
-            roll = float(curve_interp(last, [T_])[0] - curve_interp(last, [T_ - 1])[0]) * 100 if T_ > 1 else np.nan
-            legs[t] = (running, be, roll)
+            running = (y_ - fund) * 100                                # bp/yr of notional, funded at 3M comp. SORA
+            if T_ < 1:
+                legs[t] = (running, np.nan, np.nan, y_, np.nan)
+                continue
+            y_h = float(curve_interp(last, [T_ - 1])[0]) if T_ > 1 else y_
+            d_now, d_h = _mdur(y_, T_), _mdur(y_h, T_ - 1)
+            be = running / d_now
+            roll = (y_ - y_h) * 100 * d_h / d_now
+            legs[t] = (running, be, roll, y_, d_now)
 
         def row(name, s_, unit, running=np.nan, be=np.nan, roll=np.nan):
             s_ = s_.dropna()
@@ -1629,7 +1640,7 @@ with tabs[1]:
 
         outr = [row("SORA", sora, "%"), row("1M Comp. SORA", csora1, "%"), row("3M Comp. SORA", csora3, "%"),
                 row("6M Comp. SORA", csora6, "%")]
-        outr += [row(f"{t} {'T-Bill' if SGS_TENOR_YEARS[t] <= 1 else 'SGS'}", _col(sgs, t), "%", *legs[t])
+        outr += [row(f"{t} {'T-Bill' if SGS_TENOR_YEARS[t] <= 1 else 'SGS'}", _col(sgs, t), "%", *legs[t][:3])
                  for t in live_tenors if t in legs]
 
         def combo(defs):
@@ -1646,7 +1657,7 @@ with tabs[1]:
                                       row("2Y SGS − UST", sgs_ust_2, "bp"), row("10Y SGS − UST", sgs_ust_10, "bp")]
         fly = combo(SG_RM_FLIES)
         clean = lambda rows: pd.DataFrame([r for r in rows if r is not None])
-        return clean(outr), clean(spr), clean(fly), fund, fund_dt
+        return clean(outr), clean(spr), clean(fly), fund, fund_dt, legs
 
     def render_sg_monitor_table(df, key, show_running):
         if df.empty:
@@ -1671,37 +1682,89 @@ with tabs[1]:
         view = view.drop(columns="_unit")
         chg = ["Δ1D (bp)", "Δ1W (bp)", "Δ1M (bp)", "Δ3M (bp)"]
         carry = [c for c in ["Carry (bp/yr)", "Breakeven carry (bp yld/yr)", "Roll 1Y (bp)", "Carry+Roll (bp yld/yr)"] if c in view]
-        # callables rather than format strings + na_rep: st.dataframe renders a Styler's NaNs as "None" otherwise
-        fmt = lambda f: (lambda v: "—" if v is None or pd.isna(v) else format(v, f))
-        st.dataframe(view.style.format({**{c: fmt("+.1f") for c in chg + carry}, "Z 1M": fmt("+.2f"), "Z 3M": fmt("+.2f"),
-                                        "Z 1Y": fmt("+.2f"), "1Y %ile": fmt(".0f"), "5Y %ile": fmt(".0f"), "1Y vol (bp)": fmt(".0f"),
-                                        "C+R / Vol": fmt("+.2f")})
-                     .map(_chgcolor, subset=chg + carry).map(_zcolor, subset=["Z 1M", "Z 3M", "Z 1Y", "C+R / Vol"])
-                     .map(_pctcolor, subset=["1Y %ile", "5Y %ile"]),
-                     hide_index=True, use_container_width=True, height=36 * (len(view) + 1))
+        # Display values are pre-formatted text ("—" for missing): st.dataframe ignores a Styler's formatting for
+        # missing values and prints "None" (verified 2026-10-09). Colours are computed from the numbers.
+        formats = {**{c: "+.1f" for c in chg + carry}, "Z 1M": "+.2f", "Z 3M": "+.2f", "Z 1Y": "+.2f",
+                   "1Y %ile": ".0f", "5Y %ile": ".0f", "1Y vol (bp)": ".0f", "C+R / Vol": "+.2f"}
+        num = view.copy()
+        for c, f in formats.items():
+            if c in view:
+                num[c] = pd.to_numeric(num[c], errors="coerce")
+                view[c] = ["—" if pd.isna(v) else format(v, f) for v in num[c]]
+        def _colors(fn, cols):
+            return lambda col: [fn(v) for v in num[col.name]] if col.name in cols else [""] * len(col)
+        zc = ["Z 1M", "Z 3M", "Z 1Y", "C+R / Vol"]
+        pc = ["1Y %ile", "5Y %ile"]
+        styled = (view.style.apply(_colors(_chgcolor, chg + carry), subset=[c for c in chg + carry if c in view])
+                  .apply(_colors(_zcolor, zc), subset=zc).apply(_colors(_pctcolor, pc), subset=pc))
+        st.dataframe(styled, hide_index=True, use_container_width=True, height=36 * (len(view) + 1))
         csv_download(df.drop(columns="_unit"), f"sg_rates_monitor_{key}")
 
     with st.expander("Rates Monitor — outrights, spreads & flies", expanded=True):
         try:
-            rm_out, rm_spr, rm_fly, rm_fund, rm_fund_dt = build_sg_rates_monitor()
+            rm_out, rm_spr, rm_fly, rm_fund, rm_fund_dt, rm_legs = build_sg_rates_monitor()
         except Exception as e:
             st.warning(f"Could not build the rates monitor: {e}")
             rm_out = None
         if rm_out is not None:
             st.caption(f"Carry is for receiving each tenor funded at 3M compounded SORA ({rm_fund:.2f}%, {rm_fund_dt:%d %b}). "
                        "Carry (bp/yr) = (yield − funding) × 100, annualised running carry. Breakeven carry = that ÷ modified "
-                       "duration (the yield rise one year of carry offsets). Roll 1Y = rolldown on today's curve. "
-                       "C+R / Vol = (breakeven carry + roll) ÷ 1Y realised vol. Tenors of 1Y and under (and flies using them) "
-                       "are blank there, since they mature inside the 1Y horizon. Spreads & flies are DV01-neutral and shown "
-                       "for being LONG the spread (steepener / long fly, i.e. paying the positive-weight legs); the SORA, bill "
-                       "and SGS−UST spreads have no carry figures. Changes in bps; percentile = where today's level sits in "
-                       "its own trailing 1Y / 5Y range.")
+                       "duration. Roll 1Y = the yield drop from rolling one year down today's curve × the bond's duration a year "
+                       "from now ÷ today's duration (a 1Y simply matures, so all its return is carry and its roll is 0). Both are "
+                       "in bp of yield per unit of today's DV01, so DV01-neutral spread/fly legs add straight up. "
+                       "C+R / Vol = (breakeven carry + roll) ÷ 1Y realised vol. Tenors under 1Y (and spreads using them) are blank, "
+                       "since they mature before the 1Y horizon; the SORA, bill and SGS−UST spreads have no carry figures. Use the "
+                       "toggle below for steepener vs flattener and the leg breakdown to see how each spread nets. Changes in bps; "
+                       "percentile = where today's level sits in its own trailing 1Y / 5Y range.")
             with st.expander("Outright Rates", expanded=True):
                 render_sg_monitor_table(rm_out, "outright", show_running=True)
+
+            # Position toggle + leg breakdown (same as indonesia_macro.py)
+            rm_side = st.radio("Spreads & flies shown for", ["Steepener / long fly", "Flattener / short fly"], horizontal=True,
+                               key="sg_rm_side",
+                               help="Steepener = receive the short leg, pay the long leg (profits if the spread widens). "
+                                    "Flattener = the reverse. Long fly = pay the belly, receive the wings. Level, changes and "
+                                    "z-scores describe the spread itself and don't change; carry and roll flip sign.")
+            rm_sign = 1 if rm_side.startswith("Steepener") else -1
+
+            def _rm_side_view(df):
+                df = df.copy()
+                for c in ["Breakeven carry (bp yld/yr)", "Roll 1Y (bp)", "Carry+Roll (bp yld/yr)", "C+R / Vol"]:
+                    if c in df:
+                        df[c] = df[c] * rm_sign
+                return df
             with st.expander("Spreads", expanded=True):
-                render_sg_monitor_table(rm_spr, "spreads", show_running=False)
+                render_sg_monitor_table(_rm_side_view(rm_spr), "spreads", show_running=False)
             with st.expander("Flies", expanded=True):
-                render_sg_monitor_table(rm_fly, "flies", show_running=False)
+                render_sg_monitor_table(_rm_side_view(rm_fly), "flies", show_running=False)
+            with st.expander("Leg breakdown — how a spread's carry & roll nets out", expanded=False):
+                _combos = {**SG_RM_SPREADS, **SG_RM_FLIES}
+                _avail = [n for n, w in _combos.items() if all(k in rm_legs and pd.notna(rm_legs[k][1]) for k in w)]
+                if _avail:
+                    _pick = st.selectbox("Spread or fly", _avail, key="sg_rm_leg_pick")
+                    _w = _combos[_pick]
+                    _ref = max(_w, key=lambda k: SGS_TENOR_YEARS[k])
+                    _rows = []
+                    for k, wt in sorted(_w.items(), key=lambda kv: SGS_TENOR_YEARS[kv[0]]):
+                        running, be, roll, y, d_now = rm_legs[k]
+                        pos = -1 * np.sign(wt) * rm_sign                    # +1 = receive (long bond), -1 = pay
+                        _rows.append({"Leg": k, "Yield": f"{y:.3f}%", "Position": "Receive (long bond)" if pos > 0 else "Pay (short bond)",
+                                       "DV01 weight": abs(wt), "Notional vs longest leg": abs(wt) / d_now / (abs(_w[_ref]) / rm_legs[_ref][4]),
+                                       "Carry (bp yld/yr)": pos * abs(wt) * be, "Roll (bp)": pos * abs(wt) * roll,
+                                       "Carry+Roll (bp)": pos * abs(wt) * (be + roll)})
+                    _ldf = pd.DataFrame(_rows)
+                    _ldf = pd.concat([_ldf, pd.DataFrame([{"Leg": "Net", "Yield": "", "Position": rm_side, "DV01 weight": np.nan,
+                                                           "Notional vs longest leg": np.nan,
+                                                           **{c: _ldf[c].sum() for c in ["Carry (bp yld/yr)", "Roll (bp)", "Carry+Roll (bp)"]}}])],
+                                     ignore_index=True)
+                    _disp = _ldf.copy()
+                    for c, f in [("DV01 weight", ".0f"), ("Notional vs longest leg", ".2f"), ("Carry (bp yld/yr)", "+.1f"),
+                                 ("Roll (bp)", "+.1f"), ("Carry+Roll (bp)", "+.1f")]:
+                        _disp[c] = ["" if pd.isna(v) else format(v, f) for v in _ldf[c]]
+                    st.table(_disp.set_index("Leg"))
+                    st.caption("Each leg is sized to its DV01 weight (spreads 1:1, flies 1:2:1), so a parallel move nets to "
+                               "zero - which needs a much larger notional in the short leg. Carry and roll are in bp of yield "
+                               "per unit of DV01, so the legs add straight up to the net.")
 
     # SORA curve snapshots - same snapshot treatment as the SGS curve below (Latest/1D/1W/1M/3M
     # Ago), but across the SORA family's own tenor points: overnight SORA plus 1M/3M/6M
@@ -1791,7 +1854,10 @@ with tabs[1]:
             dur = (1 - (1 + yT / 200) ** (-2 * T_)) / (yT / 100)
             carry_px = (yT - fund) * 100 * 0.25
             carry = carry_px / dur
-            roll = float(curve_interp(last_curve, [SGS_TENOR_YEARS[t]])[0] - curve_interp(last_curve, [SGS_TENOR_YEARS[t] - 0.25])[0]) * 100
+            # Roll valued at the duration the bond will have in 3 months, per unit of today's duration (same units as
+            # carry above) - see the rates-monitor note on why today's duration overstates short tenors' roll.
+            y_h = float(curve_interp(last_curve, [T_ - 0.25])[0])
+            roll = (yT - y_h) * 100 * _mdur(y_h, T_ - 0.25) / dur
             vol = sgs[t].dropna().diff().iloc[-63:].std() * 100 * np.sqrt(63)
             rows_.append({"Tenor": t, "Yield %": yT, "Mod. duration": dur, "Carry (bps price, 3M)": carry_px,
                           "Carry (bps yield, 3M)": carry, "Roll (bps, 3M)": roll,
